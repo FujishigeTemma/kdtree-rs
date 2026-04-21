@@ -1,0 +1,44 @@
+[build-system]
+requires = ["maturin>=1.13,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "kdtree"
+version = "0.1.0"
+description = "A minimal, high-performance KDTree for free-threaded CPython"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = ["numpy>=2.4"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.13,<2.0",
+    "pytest>=9.0.3",
+    "ruff>=0.15.11",
+]
+bench = [
+    "scipy>=1.17.1",
+]
+
+[tool.maturin]
+module-name = "kdtree._core"
+python-source = "python"
+python-packages = ["kdtree"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

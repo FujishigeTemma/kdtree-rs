@@ -1,0 +1,20 @@
+[package]
+name = "kdtree"
+version = "0.1.0"
+edition = "2024"
+description = "A minimal, high-performance KDTree for free-threaded CPython"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+
+[lib]
+name = "kdtree"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ndarray = "0.17.1"
+numpy = "0.28.0"
+pyo3 = "0.28.3"
+rayon = "1.11.0"
+
+[dev-dependencies]
+approx = "0.5.1"
