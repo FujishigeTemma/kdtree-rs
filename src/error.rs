@@ -5,7 +5,6 @@ pub enum KDTreeError {
     EmptyData,
     InvalidLeafsize,
     InvalidK,
-    InvalidRadius(f64),
     InvalidMetric(f64),
     InvalidEps(f64),
     InvalidMaxDistance(f64),
@@ -20,9 +19,6 @@ impl fmt::Display for KDTreeError {
             Self::EmptyData => write!(f, "data must contain at least one point"),
             Self::InvalidLeafsize => write!(f, "leafsize must be greater than zero"),
             Self::InvalidK => write!(f, "k must be greater than zero"),
-            Self::InvalidRadius(radius) => {
-                write!(f, "radius must be finite and non-negative, got {radius}")
-            }
             Self::InvalidMetric(p) => {
                 write!(f, "p must be finite and >= 1, or infinity, got {p}")
             }

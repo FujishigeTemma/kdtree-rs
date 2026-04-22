@@ -22,19 +22,3 @@ class KDTree:
         eps: float = 0.0,
         parallel: bool | None = None,
     ) -> tuple[NDArray[np.float64], NDArray[np.int64]]: ...
-    def query_radius(
-        self,
-        x: ArrayLike,
-        radius: float,
-        *,
-        p: float = 2.0,
-        return_distance: bool = False,
-        sort: bool = False,
-        parallel: bool | None = None,
-    ) -> (
-        NDArray[np.int64]
-        | list[NDArray[np.int64]]
-        | tuple[NDArray[np.int64], NDArray[np.float64]]
-        | tuple[list[NDArray[np.int64]], list[NDArray[np.float64]]]
-    ): ...
-    def query_pairs(self, radius: float, *, p: float = 2.0) -> NDArray[np.int64]: ...

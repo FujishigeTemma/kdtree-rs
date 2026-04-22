@@ -1,6 +1,5 @@
 use ndarray::ArrayView2;
 
-use crate::data::point;
 use crate::error::KDTreeError;
 use crate::node::Node;
 
@@ -8,9 +7,9 @@ pub struct Tree {
     data: Vec<f64>,
     indices: Vec<usize>,
     nodes: Vec<Node>,
-    bbox_mins: Vec<f64>,
-    bbox_maxes: Vec<f64>,
-    root: usize,
+    root_lo: Vec<f64>,
+    root_hi: Vec<f64>,
+    root: u32,
     n_points: usize,
     ndim: usize,
     leafsize: usize,
@@ -36,21 +35,34 @@ impl Tree {
         let mut tree = Self {
             data: flattened,
             indices,
-            nodes: Vec::with_capacity(n_points.saturating_mul(2)),
-            bbox_mins: Vec::new(),
-            bbox_maxes: Vec::new(),
+            nodes: Vec::with_capacity(2 * n_points.div_ceil(leafsize.max(1))),
+            root_lo: Vec::new(),
+            root_hi: Vec::new(),
             root: 0,
             n_points,
             ndim,
             leafsize,
         };
+        let (lo, hi) = tree.compute_bbox(0, n_points);
+        tree.root_lo = lo;
+        tree.root_hi = hi;
         let root = tree.build_node(0, n_points);
         tree.root = root;
+        tree.reorder_leaves_contiguous();
         Ok(tree)
     }
 
-    pub fn data(&self) -> &[f64] {
-        &self.data
+    /// Permute `data` so that points within each leaf live contiguously in
+    /// tree-position order. After this, `self.data[pos * ndim ..]` is the
+    /// point at tree position `pos`, and `self.indices[pos]` is that point's
+    /// original data index. Subsequent queries iterate leaves sequentially.
+    fn reorder_leaves_contiguous(&mut self) {
+        let mut reordered = Vec::with_capacity(self.data.len());
+        for &original in &self.indices {
+            let start = original * self.ndim;
+            reordered.extend_from_slice(&self.data[start..start + self.ndim]);
+        }
+        self.data = reordered;
     }
 
     pub fn ndim(&self) -> usize {
@@ -65,82 +77,78 @@ impl Tree {
         self.leafsize
     }
 
-    pub(crate) fn root(&self) -> usize {
+    pub(crate) fn root(&self) -> u32 {
         self.root
     }
 
-    pub(crate) fn node(&self, index: usize) -> &Node {
-        &self.nodes[index]
+    pub(crate) fn node(&self, index: u32) -> &Node {
+        &self.nodes[index as usize]
     }
 
     pub(crate) fn points_indexed(&self) -> &[usize] {
         &self.indices
     }
 
-    pub(crate) fn point(&self, index: usize) -> &[f64] {
-        point(&self.data, self.ndim, index)
+    pub(crate) fn root_bbox(&self) -> (&[f64], &[f64]) {
+        (&self.root_lo, &self.root_hi)
     }
 
-    pub(crate) fn bbox(&self, node: usize) -> (&[f64], &[f64]) {
-        let start = node * self.ndim;
-        (
-            &self.bbox_mins[start..start + self.ndim],
-            &self.bbox_maxes[start..start + self.ndim],
-        )
+    /// Return the contiguous slice of coordinates for tree positions
+    /// `[start, end)`. After the leaf reorder this corresponds exactly to the
+    /// points in the leaf/subtree, laid out row-major.
+    pub(crate) fn leaf_block(&self, start: usize, end: usize) -> &[f64] {
+        &self.data[start * self.ndim..end * self.ndim]
     }
 
-    fn build_node(&mut self, start: usize, end: usize) -> usize {
-        let node_index = self.nodes.len();
-        self.nodes.push(Node {
-            start,
-            end,
-            split_dim: 0,
-            split_value: 0.0,
-            left: None,
-            right: None,
-            leaf: false,
-        });
-
-        let (mins, maxes) = self.compute_bbox(start, end);
-        self.bbox_mins.extend_from_slice(&mins);
-        self.bbox_maxes.extend_from_slice(&maxes);
-
+    fn build_node(&mut self, start: usize, end: usize) -> u32 {
         let len = end - start;
         if len <= self.leafsize {
-            self.nodes[node_index].leaf = true;
-            return node_index;
+            let id = self.nodes.len() as u32;
+            self.nodes.push(Node::Leaf {
+                start: start as u32,
+                end: end as u32,
+            });
+            return id;
         }
 
+        let (mins, maxes) = self.compute_bbox(start, end);
         let split_dim = widest_dimension(&mins, &maxes);
         let mid = start + len / 2;
+        let ndim = self.ndim;
+        let data = &self.data;
         self.indices[start..end].select_nth_unstable_by(mid - start, |lhs, rhs| {
-            let lhs_value = self.data[*lhs * self.ndim + split_dim];
-            let rhs_value = self.data[*rhs * self.ndim + split_dim];
+            let lhs_value = data[*lhs * ndim + split_dim];
+            let rhs_value = data[*rhs * ndim + split_dim];
             lhs_value.total_cmp(&rhs_value)
         });
+        let split_value = self.data[self.indices[mid] * ndim + split_dim];
 
-        let split_value = self.data[self.indices[mid] * self.ndim + split_dim];
+        let id = self.nodes.len() as u32;
+        self.nodes.push(Node::Leaf { start: 0, end: 0 }); // placeholder
+
         let left = self.build_node(start, mid);
         let right = self.build_node(mid, end);
-        self.nodes[node_index] = Node {
-            start,
-            end,
-            split_dim,
+        self.nodes[id as usize] = Node::Inner {
+            left,
+            right,
+            split_dim: split_dim as u32,
             split_value,
-            left: Some(left),
-            right: Some(right),
-            leaf: false,
         };
-        node_index
+        id
     }
 
     fn compute_bbox(&self, start: usize, end: usize) -> (Vec<f64>, Vec<f64>) {
-        let first = self.point(self.indices[start]);
+        let ndim = self.ndim;
+        let row = |idx: usize| {
+            let base = idx * ndim;
+            &self.data[base..base + ndim]
+        };
+        let first = row(self.indices[start]);
         let mut mins = first.to_vec();
         let mut maxes = first.to_vec();
         for &point_index in &self.indices[start + 1..end] {
-            let coords = self.point(point_index);
-            for dim in 0..self.ndim {
+            let coords = row(point_index);
+            for dim in 0..ndim {
                 mins[dim] = mins[dim].min(coords[dim]);
                 maxes[dim] = maxes[dim].max(coords[dim]);
             }
@@ -184,7 +192,7 @@ mod tests {
         assert_eq!(tree.n_points(), 4);
         assert_eq!(tree.ndim(), 2);
         assert_eq!(tree.leafsize(), 2);
-        let (mins, maxes) = tree.bbox(tree.root());
+        let (mins, maxes) = tree.root_bbox();
         assert_relative_eq!(mins[0], 0.0);
         assert_relative_eq!(mins[1], 0.0);
         assert_relative_eq!(maxes[0], 3.0);

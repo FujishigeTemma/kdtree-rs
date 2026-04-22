@@ -53,118 +53,96 @@ impl Metric {
         }
     }
 
+    /// Accumulate the per-axis contributions of `(lhs - rhs)` and return as
+    /// soon as a chunk's running total exceeds `bound`. The accumulator is
+    /// monotonically non-decreasing for every supported metric, so the
+    /// early-out value is still a valid lower bound that the caller can
+    /// compare against `bound` to reject the point.
+    ///
+    /// We bound-check at chunk boundaries instead of every axis so LLVM can
+    /// still auto-vectorize the inner accumulation; per-axis branching kills
+    /// SIMD and is a net loss even for moderate `ndim`.
     #[inline]
-    pub fn point_accum(self, lhs: &[f64], rhs: &[f64]) -> f64 {
+    pub fn point_accum(self, lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
+        const CHUNK: usize = 8;
+        let mut acc = 0.0_f64;
+        let mut lhs_rest = lhs;
+        let mut rhs_rest = rhs;
+        while lhs_rest.len() >= CHUNK {
+            let (l_head, l_tail) = lhs_rest.split_at(CHUNK);
+            let (r_head, r_tail) = rhs_rest.split_at(CHUNK);
+            acc = self.fold_block(acc, l_head, r_head);
+            if acc > bound {
+                return acc;
+            }
+            lhs_rest = l_tail;
+            rhs_rest = r_tail;
+        }
+        self.fold_block(acc, lhs_rest, rhs_rest)
+    }
+
+    #[inline(always)]
+    fn fold_block(self, mut acc: f64, lhs: &[f64], rhs: &[f64]) -> f64 {
         match self {
-            Self::L1 => lhs.iter().zip(rhs).map(|(a, b)| (a - b).abs()).sum(),
-            Self::L2 => lhs
-                .iter()
-                .zip(rhs)
-                .map(|(a, b)| {
+            Self::L1 => {
+                for (a, b) in lhs.iter().zip(rhs) {
+                    acc += (a - b).abs();
+                }
+            }
+            Self::L2 => {
+                for (a, b) in lhs.iter().zip(rhs) {
                     let delta = a - b;
-                    delta * delta
-                })
-                .sum(),
-            Self::LInf => lhs
-                .iter()
-                .zip(rhs)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0, f64::max),
-            Self::LP(p) => lhs
-                .iter()
-                .zip(rhs)
-                .map(|(a, b)| (a - b).abs().powf(p))
-                .sum(),
+                    acc += delta * delta;
+                }
+            }
+            Self::LInf => {
+                for (a, b) in lhs.iter().zip(rhs) {
+                    let delta = (a - b).abs();
+                    if delta > acc {
+                        acc = delta;
+                    }
+                }
+            }
+            Self::LP(p) => {
+                for (a, b) in lhs.iter().zip(rhs) {
+                    acc += (a - b).abs().powf(p);
+                }
+            }
         }
+        acc
     }
 
     #[inline]
-    pub fn bbox_point_lower_bound(self, query: &[f64], mins: &[f64], maxes: &[f64]) -> f64 {
+    pub fn axis_accum(self, diff: f64) -> f64 {
         match self {
-            Self::L1 => query
-                .iter()
-                .zip(mins.iter().zip(maxes))
-                .map(|(q, (min, max))| distance_to_interval(*q, *min, *max))
-                .sum(),
-            Self::L2 => query
-                .iter()
-                .zip(mins.iter().zip(maxes))
-                .map(|(q, (min, max))| {
-                    let delta = distance_to_interval(*q, *min, *max);
-                    delta * delta
-                })
-                .sum(),
-            Self::LInf => query
-                .iter()
-                .zip(mins.iter().zip(maxes))
-                .map(|(q, (min, max))| distance_to_interval(*q, *min, *max))
-                .fold(0.0, f64::max),
-            Self::LP(p) => query
-                .iter()
-                .zip(mins.iter().zip(maxes))
-                .map(|(q, (min, max))| distance_to_interval(*q, *min, *max).powf(p))
-                .sum(),
+            Self::L1 | Self::LInf => diff.abs(),
+            Self::L2 => {
+                let a = diff.abs();
+                a * a
+            }
+            Self::LP(p) => diff.abs().powf(p),
         }
     }
 
+    /// Fold a per-axis contribution into a running accumulator. Sum for
+    /// L^p, max for L^inf.
     #[inline]
-    pub fn bbox_bbox_lower_bound(
-        self,
-        mins_a: &[f64],
-        maxes_a: &[f64],
-        mins_b: &[f64],
-        maxes_b: &[f64],
-    ) -> f64 {
+    pub fn fold_axis(self, acc: f64, axis: f64) -> f64 {
         match self {
-            Self::L1 => mins_a
-                .iter()
-                .zip(maxes_a)
-                .zip(mins_b.iter().zip(maxes_b))
-                .map(|((min_a, max_a), (min_b, max_b))| interval_gap(*min_a, *max_a, *min_b, *max_b))
-                .sum(),
-            Self::L2 => mins_a
-                .iter()
-                .zip(maxes_a)
-                .zip(mins_b.iter().zip(maxes_b))
-                .map(|((min_a, max_a), (min_b, max_b))| {
-                    let gap = interval_gap(*min_a, *max_a, *min_b, *max_b);
-                    gap * gap
-                })
-                .sum(),
-            Self::LInf => mins_a
-                .iter()
-                .zip(maxes_a)
-                .zip(mins_b.iter().zip(maxes_b))
-                .map(|((min_a, max_a), (min_b, max_b))| interval_gap(*min_a, *max_a, *min_b, *max_b))
-                .fold(0.0, f64::max),
-            Self::LP(p) => mins_a
-                .iter()
-                .zip(maxes_a)
-                .zip(mins_b.iter().zip(maxes_b))
-                .map(|((min_a, max_a), (min_b, max_b))| interval_gap(*min_a, *max_a, *min_b, *max_b).powf(p))
-                .sum(),
+            Self::LInf => acc.max(axis),
+            _ => acc + axis,
         }
     }
-}
 
-#[inline]
-fn distance_to_interval(value: f64, min: f64, max: f64) -> f64 {
-    if value < min {
-        min - value
-    } else if value > max {
-        value - max
-    } else {
-        0.0
-    }
-}
-
-#[inline]
-fn interval_gap(min_a: f64, max_a: f64, min_b: f64, max_b: f64) -> f64 {
-    if max_a < min_b {
-        min_b - max_a
-    } else if max_b < min_a {
-        min_a - max_b
-    } else {
-        0.0
+    /// Update an accumulator when a single axis's contribution changes from
+    /// `old_axis` to `new_axis`. The caller must guarantee
+    /// `new_axis >= old_axis`, which is always the case when descending from
+    /// a parent cell into the far child along the split.
+    #[inline]
+    pub fn replace_axis(self, total: f64, old_axis: f64, new_axis: f64) -> f64 {
+        match self {
+            Self::LInf => total.max(new_axis),
+            _ => total - old_axis + new_axis,
+        }
     }
 }

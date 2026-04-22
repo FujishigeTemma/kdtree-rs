@@ -1,17 +1,14 @@
-mod data;
 mod error;
 mod metric;
 mod node;
-mod pairs;
 mod query;
-mod radius;
 mod tree;
 
 use ndarray::{Array2, Ix1, Ix2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArrayDyn};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyAny, PyList, PyModule};
+use pyo3::types::{IntoPyDict, PyAny, PyModule};
 
 use crate::error::KDTreeError;
 use crate::tree::Tree;
@@ -97,9 +94,9 @@ impl KDTree {
         let matrix = view
             .into_dimensionality::<Ix2>()
             .map_err(|_| kd_error(KDTreeError::InvalidShape("data must be a two-dimensional array")))?;
+        let original: Vec<f64> = matrix.iter().copied().collect();
         let tree = Tree::new(matrix, leafsize).map_err(kd_error)?;
-        let payload = tree.data().to_vec();
-        Ok(Self { tree, data: payload })
+        Ok(Self { tree, data: original })
     }
 
     #[getter]
@@ -150,24 +147,15 @@ impl KDTree {
         parallel: Option<bool>,
     ) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let (queries, n_queries, single) = parse_queries(py, &x, self.tree.ndim())?;
-        let (distances, indices) = if single {
-            self.tree.query_one(&queries, k, p, max_distance, eps)
-        } else {
-            self.tree.query_many(
-                &queries,
-                n_queries,
-                k,
-                p,
-                max_distance,
-                eps,
-                auto_parallel(parallel, n_queries),
-            )
-        }
-        .map_err(kd_error)?;
+        let parallel = auto_parallel(parallel, n_queries);
+        let (distances, indices) = self
+            .tree
+            .query(&queries, k, p, max_distance, eps, parallel)
+            .map_err(kd_error)?;
 
         if single {
             let py_distances = PyArray1::from_vec(py, distances).into_any().unbind();
-            let py_indices = PyArray1::from_vec(py, indices.into_iter().map(|index| index as i64).collect())
+            let py_indices = PyArray1::from_vec(py, indices.into_iter().map(|i| i as i64).collect())
                 .into_any()
                 .unbind();
             Ok((py_distances, py_indices))
@@ -178,7 +166,7 @@ impl KDTree {
             )
             .into_any()
             .unbind();
-            let converted = indices.into_iter().map(|index| index as i64).collect::<Vec<_>>();
+            let converted = indices.into_iter().map(|i| i as i64).collect::<Vec<_>>();
             let py_indices = PyArray2::from_owned_array(
                 py,
                 Array2::from_shape_vec((n_queries, k), converted).expect("shape should match"),
@@ -187,82 +175,6 @@ impl KDTree {
             .unbind();
             Ok((py_distances, py_indices))
         }
-    }
-
-    #[pyo3(signature = (x, radius, *, p = 2.0, return_distance = false, sort = false, parallel = None))]
-    fn query_radius<'py>(
-        &self,
-        py: Python<'py>,
-        x: Bound<'py, PyAny>,
-        radius: f64,
-        p: f64,
-        return_distance: bool,
-        sort: bool,
-        parallel: Option<bool>,
-    ) -> PyResult<Py<PyAny>> {
-        let (queries, n_queries, single) = parse_queries(py, &x, self.tree.ndim())?;
-        if single {
-            let (indices, distances) = self
-                .tree
-                .query_radius_one(&queries, radius, p, sort)
-                .map_err(kd_error)?;
-            let py_indices =
-                PyArray1::from_vec(py, indices.into_iter().map(|index| index as i64).collect::<Vec<_>>())
-                    .into_any()
-                    .unbind();
-            if return_distance {
-                let py_distances = PyArray1::from_vec(py, distances).into_any().unbind();
-                let tuple = pyo3::types::PyTuple::new(py, [py_indices, py_distances])?;
-                Ok(tuple.into_any().unbind())
-            } else {
-                Ok(py_indices)
-            }
-        } else {
-            let (indices, distances) = self
-                .tree
-                .query_radius_many(
-                    &queries,
-                    n_queries,
-                    radius,
-                    p,
-                    sort,
-                    auto_parallel(parallel, n_queries),
-                )
-                .map_err(kd_error)?;
-            let py_indices = PyList::empty(py);
-            for chunk in indices {
-                py_indices.append(PyArray1::from_vec(
-                    py,
-                    chunk.into_iter().map(|index| index as i64).collect::<Vec<_>>(),
-                ))?;
-            }
-            if return_distance {
-                let py_distances = PyList::empty(py);
-                for chunk in distances {
-                    py_distances.append(PyArray1::from_vec(py, chunk))?;
-                }
-                let tuple = pyo3::types::PyTuple::new(py, [py_indices.into_any().unbind(), py_distances.into_any().unbind()])?;
-                Ok(tuple.into_any().unbind())
-            } else {
-                Ok(py_indices.into_any().unbind())
-            }
-        }
-    }
-
-    #[pyo3(signature = (radius, *, p = 2.0))]
-    fn query_pairs<'py>(
-        &self,
-        py: Python<'py>,
-        radius: f64,
-        p: f64,
-    ) -> PyResult<Bound<'py, PyArray2<i64>>> {
-        let pairs = self.tree.query_pairs(radius, p).map_err(kd_error)?;
-        let flat = pairs
-            .into_iter()
-            .flat_map(|pair| [pair[0] as i64, pair[1] as i64])
-            .collect::<Vec<_>>();
-        let array = Array2::from_shape_vec((flat.len() / 2, 2), flat).expect("shape should match");
-        Ok(PyArray2::from_owned_array(py, array))
     }
 }
 

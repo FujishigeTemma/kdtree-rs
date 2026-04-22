@@ -40,32 +40,6 @@ def test_query_batch_returns_rank_2_arrays() -> None:
     np.testing.assert_array_equal(indices[1], [2, 1])
 
 
-def test_query_radius_single_returns_index_array() -> None:
-    tree = KDTree([[0.0, 0.0], [1.0, 0.0], [4.0, 0.0]])
-
-    indices = tree.query_radius([0.1, 0.0], 1.1, sort=True)
-
-    np.testing.assert_array_equal(indices, [0, 1])
-
-
-def test_query_radius_batch_returns_lists_of_arrays() -> None:
-    tree = KDTree([[0.0, 0.0], [1.0, 0.0], [4.0, 0.0]])
-
-    indices = tree.query_radius([[0.1, 0.0], [3.9, 0.0]], 1.1, sort=True)
-
-    assert len(indices) == 2
-    np.testing.assert_array_equal(indices[0], [0, 1])
-    np.testing.assert_array_equal(indices[1], [2])
-
-
-def test_query_pairs_returns_compact_pair_array() -> None:
-    tree = KDTree([[0.0, 0.0], [0.5, 0.0], [2.0, 0.0], [2.3, 0.0]])
-
-    pairs = tree.query_pairs(0.6)
-
-    np.testing.assert_array_equal(pairs, [[0, 1], [2, 3]])
-
-
 def test_invalid_inputs_raise_value_error() -> None:
     tree = KDTree([[0.0, 0.0], [1.0, 0.0]])
 
@@ -74,9 +48,6 @@ def test_invalid_inputs_raise_value_error() -> None:
 
     with pytest.raises(ValueError):
         tree.query([0.0, 0.0], k=0)
-
-    with pytest.raises(ValueError):
-        tree.query_radius([0.0, 0.0], -1.0)
 
 
 def test_parallel_query_matches_serial_query() -> None:
