@@ -1,6 +1,20 @@
-# kdtree
+# kdtree-rs
 
 A minimal, high-performance KDTree for free-threaded CPython.
+
+## Install
+
+```bash
+pip install kdtree-rs
+# or
+uv add kdtree-rs
+```
+
+Requires Python 3.13+ with free-threaded build (`cp313t` / `cp314t`).
+
+## Usage
+
+The PyPI distribution `kdtree-rs` is imported as `kdtree`:
 
 ```python
 import numpy as np
