@@ -15,12 +15,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
       - name: Check PyPI for existing version
         id: check
         run: |
-          VERSION=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           STATUS=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/kdtree-rs/$VERSION/json")
           if [ "$STATUS" = "404" ]; then
