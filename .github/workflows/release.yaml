@@ -4,17 +4,35 @@ on:
   push:
     branches:
       - main
-    tags:
-      - '*'
-  pull_request:
-  workflow_dispatch:
-
-permissions:
-  contents: read
 
 jobs:
+  check-version:
+    name: Check if version is new
+    runs-on: ubuntu-latest
+    outputs:
+      should-release: ${{ steps.check.outputs.should-release }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8
+      - name: Check PyPI for existing version
+        id: check
+        run: |
+          VERSION=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/kdtree-rs/$VERSION/json")
+          if [ "$STATUS" = "404" ]; then
+            echo "should-release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should-release=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build (${{ matrix.platform }}-${{ matrix.target }})
+    needs: check-version
+    if: needs.check-version.outputs.should-release == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -37,7 +55,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist -i python3.13t -i python3.14t
-          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          sccache: true
           manylinux: auto
       - name: Upload wheels
         uses: actions/upload-artifact@v7
@@ -47,6 +65,8 @@ jobs:
 
   sdist:
     name: Build sdist
+    needs: check-version
+    if: needs.check-version.outputs.should-release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -56,16 +76,15 @@ jobs:
           command: sdist
           args: --out dist
       - name: Upload sdist
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-sdist
           path: dist
 
-  release:
+  pypi:
     name: Publish to PyPI
-    runs-on: ubuntu-latest
-    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
     needs: [build, sdist]
+    runs-on: ubuntu-latest
     environment:
       name: pypi
     permissions:
@@ -78,12 +97,24 @@ jobs:
           pattern: wheels-*
           path: dist
           merge-multiple: true
-      - name: Generate artifact attestation
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8
+      - name: Smoke test (Linux x86_64 wheel)
+        run: |
+          uv run --isolated --no-project --python 3.13t \
+            --with dist/kdtree_rs-*-cp313-cp313t-manylinux*x86_64*.whl \
+            python -c "
+          import numpy as np
+          from kdtree import KDTree
+          data = np.random.default_rng(0).standard_normal((50, 3))
+          tree = KDTree(data)
+          d, i = tree.query(data[:5], k=3)
+          assert d.shape == (5, 3) and i.shape == (5, 3)
+          print('smoke test passed')
+          "
+      - name: Generate attestations
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: 'dist/*'
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8
-      - name: Publish to PyPI
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
-        run: uv publish 'dist/*' --check-url https://pypi.org/simple/
+      - name: Publish
+        run: uv publish --check-url https://pypi.org/simple/
