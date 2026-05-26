@@ -62,10 +62,6 @@ fn parse_queries<'py>(
     }
 }
 
-fn auto_parallel(parallel: Option<bool>, n_queries: usize) -> bool {
-    parallel.unwrap_or(n_queries >= 256)
-}
-
 #[pyclass(module = "kdtree._core", frozen)]
 struct KDTree {
     tree: Tree,
@@ -135,7 +131,7 @@ impl KDTree {
         )
     }
 
-    #[pyo3(signature = (x, *, k = 1, p = 2.0, max_distance = None, eps = 0.0, parallel = None))]
+    #[pyo3(signature = (x, *, k = 1, p = 2.0, max_distance = None, eps = 0.0, parallel = false))]
     fn query<'py>(
         &self,
         py: Python<'py>,
@@ -144,10 +140,9 @@ impl KDTree {
         p: f64,
         max_distance: Option<f64>,
         eps: f64,
-        parallel: Option<bool>,
+        parallel: bool,
     ) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let (queries, n_queries, single) = parse_queries(py, &x, self.tree.ndim())?;
-        let parallel = auto_parallel(parallel, n_queries);
         let (distances, indices) = self
             .tree
             .query(&queries, k, p, max_distance, eps, parallel)

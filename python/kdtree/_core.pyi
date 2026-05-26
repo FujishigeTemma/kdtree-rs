@@ -20,5 +20,5 @@ class KDTree:
         p: float = 2.0,
         max_distance: float | None = None,
         eps: float = 0.0,
-        parallel: bool | None = None,
+        parallel: bool = False,
     ) -> tuple[NDArray[np.float64], NDArray[np.int64]]: ...
