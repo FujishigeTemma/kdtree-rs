@@ -43,7 +43,7 @@ impl Tree {
         let mut tree = Self {
             data,
             indices,
-            nodes: Vec::with_capacity(2 * n_points.div_ceil(leafsize.max(1))),
+            nodes: Vec::with_capacity(2 * n_points.div_ceil(leafsize)),
             root_lo: Vec::new(),
             root_hi: Vec::new(),
             root: 0,
@@ -51,10 +51,12 @@ impl Tree {
             ndim,
             leafsize,
         };
-        let (lo, hi) = tree.compute_bbox(0, n_points);
-        tree.root_lo = lo;
-        tree.root_hi = hi;
-        let root = tree.build_node(0, n_points);
+        let mut scratch_lo = vec![0.0_f64; ndim];
+        let mut scratch_hi = vec![0.0_f64; ndim];
+        tree.compute_bbox_into(0, n_points, &mut scratch_lo, &mut scratch_hi);
+        tree.root_lo = scratch_lo.clone();
+        tree.root_hi = scratch_hi.clone();
+        let root = tree.build_node(0, n_points, &mut scratch_lo, &mut scratch_hi);
         tree.root = root;
         tree.reorder_leaves_contiguous();
         Ok(tree)
@@ -121,7 +123,13 @@ impl Tree {
         &self.data[start * self.ndim..end * self.ndim]
     }
 
-    fn build_node(&mut self, start: usize, end: usize) -> u32 {
+    fn build_node(
+        &mut self,
+        start: usize,
+        end: usize,
+        scratch_lo: &mut [f64],
+        scratch_hi: &mut [f64],
+    ) -> u32 {
         let len = end - start;
         if len <= self.leafsize {
             let id = self.nodes.len() as u32;
@@ -132,8 +140,8 @@ impl Tree {
             return id;
         }
 
-        let (mins, maxes) = self.compute_bbox(start, end);
-        let split_dim = widest_dimension(&mins, &maxes);
+        self.compute_bbox_into(start, end, scratch_lo, scratch_hi);
+        let split_dim = widest_dimension(scratch_lo, scratch_hi);
         let mid = start + len / 2;
         let ndim = self.ndim;
         let data = &self.data;
@@ -147,8 +155,8 @@ impl Tree {
         let id = self.nodes.len() as u32;
         self.nodes.push(Node::Leaf { start: 0, end: 0 }); // placeholder
 
-        let left = self.build_node(start, mid);
-        let right = self.build_node(mid, end);
+        let left = self.build_node(start, mid, scratch_lo, scratch_hi);
+        let right = self.build_node(mid, end, scratch_lo, scratch_hi);
         self.nodes[id as usize] = Node::Inner {
             left,
             right,
@@ -158,23 +166,22 @@ impl Tree {
         id
     }
 
-    fn compute_bbox(&self, start: usize, end: usize) -> (Vec<f64>, Vec<f64>) {
+    fn compute_bbox_into(&self, start: usize, end: usize, lo: &mut [f64], hi: &mut [f64]) {
         let ndim = self.ndim;
-        let row = |idx: usize| {
-            let base = idx * ndim;
-            &self.data[base..base + ndim]
-        };
-        let first = row(self.indices[start]);
-        let mut mins = first.to_vec();
-        let mut maxes = first.to_vec();
+        let lo = &mut lo[..ndim];
+        let hi = &mut hi[..ndim];
+        let first_base = self.indices[start] * ndim;
+        let first = &self.data[first_base..first_base + ndim];
+        lo.copy_from_slice(first);
+        hi.copy_from_slice(first);
         for &point_index in &self.indices[start + 1..end] {
-            let coords = row(point_index);
+            let base = point_index * ndim;
+            let coords = &self.data[base..base + ndim];
             for dim in 0..ndim {
-                mins[dim] = mins[dim].min(coords[dim]);
-                maxes[dim] = maxes[dim].max(coords[dim]);
+                lo[dim] = lo[dim].min(coords[dim]);
+                hi[dim] = hi[dim].max(coords[dim]);
             }
         }
-        (mins, maxes)
     }
 }
 
@@ -223,5 +230,23 @@ mod tests {
         let data = vec![5.0, 1.0, 2.0, 4.0, 0.0, 3.0, 6.0, 7.0];
         let tree = Tree::new(data.clone(), 4, 2, 1).expect("tree should build");
         assert_eq!(tree.original_data(), data);
+    }
+
+    #[test]
+    fn build_allocation_count_does_not_scale_with_n() {
+        let n = 1000;
+        let ndim = 8;
+        let leafsize = 16;
+        let data: Vec<f64> = (0..n * ndim).map(|i| (i as f64) * 0.001).collect();
+
+        let info = allocation_counter::measure(move || {
+            Tree::new(data, n, ndim, leafsize).expect("tree should build");
+        });
+
+        assert!(
+            info.count_total < 20,
+            "expected < 20 allocations, got {}",
+            info.count_total
+        );
     }
 }

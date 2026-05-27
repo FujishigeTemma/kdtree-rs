@@ -16,9 +16,9 @@ impl Metric {
         if !p.is_finite() || p < 1.0 {
             return Err(KDTreeError::InvalidMetric(p));
         }
-        if (p - 1.0).abs() < f64::EPSILON {
+        if p == 1.0 {
             Ok(Self::L1)
-        } else if (p - 2.0).abs() < f64::EPSILON {
+        } else if p == 2.0 {
             Ok(Self::L2)
         } else {
             Ok(Self::LP(p))

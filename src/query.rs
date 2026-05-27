@@ -44,11 +44,14 @@ impl Tree {
         let mut distances = vec![0.0_f64; n_queries * k];
         let mut indices = vec![0_usize; n_queries * k];
 
-        let run = |q_idx: usize, out_d: &mut [f64], out_i: &mut [usize]| {
-            let mut scratch = QueryScratch::new(ndim, k);
+        let run = |scratch: &mut QueryScratch,
+                   q_idx: usize,
+                   out_d: &mut [f64],
+                   out_i: &mut [usize]| {
+            scratch.reset();
             let q = &queries[q_idx * ndim..(q_idx + 1) * ndim];
             scratch.seed_from_root(q, self.root_bbox(), metric);
-            self.descend(self.root(), q, k, limit, eps_factor, metric, &mut scratch);
+            self.descend(self.root(), q, k, limit, eps_factor, metric, scratch);
             scratch.write_results(out_d, out_i, k, n_points, metric);
         };
 
@@ -57,13 +60,19 @@ impl Tree {
                 .par_chunks_mut(k)
                 .zip(indices.par_chunks_mut(k))
                 .enumerate()
-                .for_each(|(q_idx, (d_chunk, i_chunk))| run(q_idx, d_chunk, i_chunk));
+                .for_each_init(
+                    || QueryScratch::new(ndim, k),
+                    |scratch, (q_idx, (d_chunk, i_chunk))| run(scratch, q_idx, d_chunk, i_chunk),
+                );
         } else {
+            let mut scratch = QueryScratch::new(ndim, k);
             distances
                 .chunks_mut(k)
                 .zip(indices.chunks_mut(k))
                 .enumerate()
-                .for_each(|(q_idx, (d_chunk, i_chunk))| run(q_idx, d_chunk, i_chunk));
+                .for_each(|(q_idx, (d_chunk, i_chunk))| {
+                    run(&mut scratch, q_idx, d_chunk, i_chunk)
+                });
         }
 
         Ok((distances, indices))
@@ -166,6 +175,14 @@ impl QueryScratch {
         }
     }
 
+    /// Clear the k-best buffers between queries. `side` and `min_dist` are
+    /// fully overwritten by `seed_from_root`, so they don't need explicit
+    /// resetting here.
+    fn reset(&mut self) {
+        self.nb_d.clear();
+        self.nb_i.clear();
+    }
+
     fn seed_from_root(&mut self, q: &[f64], bbox: (&[f64], &[f64]), metric: Metric) {
         let (lo, hi) = bbox;
         let mut acc = 0.0_f64;
@@ -198,12 +215,14 @@ impl QueryScratch {
     #[inline]
     fn consider(&mut self, d: f64, idx: usize, k: usize) {
         if self.nb_d.len() == k {
-            let worst = self.nb_d[k - 1];
-            if d > worst || (d == worst && self.nb_i[k - 1] <= idx) {
+            let worst_d = self.nb_d[k - 1];
+            if d > worst_d || (d == worst_d && self.nb_i[k - 1] <= idx) {
                 return;
             }
+            self.nb_d.pop();
+            self.nb_i.pop();
         }
-        let mut pos = self.nb_d.len().min(k);
+        let mut pos = self.nb_d.len();
         while pos > 0 {
             let prev_d = self.nb_d[pos - 1];
             if prev_d < d || (prev_d == d && self.nb_i[pos - 1] < idx) {
@@ -211,17 +230,8 @@ impl QueryScratch {
             }
             pos -= 1;
         }
-        if self.nb_d.len() < k {
-            self.nb_d.insert(pos, d);
-            self.nb_i.insert(pos, idx);
-        } else {
-            for j in (pos + 1..k).rev() {
-                self.nb_d[j] = self.nb_d[j - 1];
-                self.nb_i[j] = self.nb_i[j - 1];
-            }
-            self.nb_d[pos] = d;
-            self.nb_i[pos] = idx;
-        }
+        self.nb_d.insert(pos, d);
+        self.nb_i.insert(pos, idx);
     }
 
     fn write_results(
