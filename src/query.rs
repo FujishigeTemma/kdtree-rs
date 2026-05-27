@@ -247,14 +247,13 @@ impl QueryScratch {
 #[cfg(test)]
 mod tests {
     use approx::assert_relative_eq;
-    use ndarray::array;
 
     use crate::tree::Tree;
 
     #[test]
     fn query_returns_exact_nearest_neighbors() {
-        let data = array![[0.0, 0.0], [2.0, 0.0], [4.0, 0.0], [5.0, 0.0]];
-        let tree = Tree::new(data.view(), 2).expect("tree should build");
+        let data = vec![0.0, 0.0, 2.0, 0.0, 4.0, 0.0, 5.0, 0.0];
+        let tree = Tree::new(data, 4, 2, 2).expect("tree should build");
 
         let (distances, indices) = tree
             .query(&[1.5, 0.0], 2, 2.0, None, 0.0, false)
@@ -267,8 +266,8 @@ mod tests {
 
     #[test]
     fn query_pads_missing_neighbors() {
-        let data = array![[0.0, 0.0], [10.0, 0.0]];
-        let tree = Tree::new(data.view(), 1).expect("tree should build");
+        let data = vec![0.0, 0.0, 10.0, 0.0];
+        let tree = Tree::new(data, 2, 2, 1).expect("tree should build");
 
         let (distances, indices) = tree
             .query(&[0.0, 0.0, 11.0, 0.0], 3, 2.0, Some(2.0), 0.0, false)

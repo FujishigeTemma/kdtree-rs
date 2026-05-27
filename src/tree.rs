@@ -1,5 +1,3 @@
-use ndarray::ArrayView2;
-
 use crate::error::KDTreeError;
 use crate::node::Node;
 
@@ -16,24 +14,34 @@ pub struct Tree {
 }
 
 impl Tree {
-    pub fn new(data: ArrayView2<'_, f64>, leafsize: usize) -> Result<Self, KDTreeError> {
+    /// Build a tree from a row-major `Vec<f64>` of length `n_points * ndim`.
+    /// Takes the data by value so the caller can release any Python borrow
+    /// before invoking us and we can run under `py.detach`.
+    pub fn new(
+        data: Vec<f64>,
+        n_points: usize,
+        ndim: usize,
+        leafsize: usize,
+    ) -> Result<Self, KDTreeError> {
         if leafsize == 0 {
             return Err(KDTreeError::InvalidLeafsize);
         }
-        if data.nrows() == 0 || data.ncols() == 0 {
+        if n_points == 0 || ndim == 0 {
             return Err(KDTreeError::EmptyData);
+        }
+        if data.len() != n_points * ndim {
+            return Err(KDTreeError::InvalidShape(
+                "data length must equal n_points * ndim",
+            ));
         }
         if !data.iter().all(|value| value.is_finite()) {
             return Err(KDTreeError::NonFiniteData);
         }
 
-        let n_points = data.nrows();
-        let ndim = data.ncols();
-        let flattened = data.iter().copied().collect::<Vec<_>>();
         let indices = (0..n_points).collect::<Vec<_>>();
 
         let mut tree = Self {
-            data: flattened,
+            data,
             indices,
             nodes: Vec::with_capacity(2 * n_points.div_ceil(leafsize.max(1))),
             root_lo: Vec::new(),
@@ -50,6 +58,19 @@ impl Tree {
         tree.root = root;
         tree.reorder_leaves_contiguous();
         Ok(tree)
+    }
+
+    /// Reconstruct the original-order data the caller passed to `new`.
+    /// Internally we keep the leaf-reordered layout for query cache locality;
+    /// the original order is only materialized on demand for the `data` getter.
+    pub fn original_data(&self) -> Vec<f64> {
+        let mut original = vec![0.0_f64; self.n_points * self.ndim];
+        for (pos, &original_idx) in self.indices.iter().enumerate() {
+            let src = pos * self.ndim;
+            let dst = original_idx * self.ndim;
+            original[dst..dst + self.ndim].copy_from_slice(&self.data[src..src + self.ndim]);
+        }
+        original
     }
 
     /// Permute `data` so that points within each leaf live contiguously in
@@ -173,21 +194,19 @@ fn widest_dimension(mins: &[f64], maxes: &[f64]) -> usize {
 #[cfg(test)]
 mod tests {
     use approx::assert_relative_eq;
-    use ndarray::array;
 
     use super::Tree;
 
     #[test]
     fn build_rejects_empty_inputs() {
-        let data = ndarray::Array2::<f64>::zeros((0, 2));
-        let result = Tree::new(data.view(), 32);
+        let result = Tree::new(Vec::new(), 0, 2, 32);
         assert!(result.is_err());
     }
 
     #[test]
     fn build_preserves_shape_information() {
-        let data = array![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]];
-        let tree = Tree::new(data.view(), 2).expect("tree should build");
+        let data = vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
+        let tree = Tree::new(data, 4, 2, 2).expect("tree should build");
 
         assert_eq!(tree.n_points(), 4);
         assert_eq!(tree.ndim(), 2);
@@ -197,5 +216,12 @@ mod tests {
         assert_relative_eq!(mins[1], 0.0);
         assert_relative_eq!(maxes[0], 3.0);
         assert_relative_eq!(maxes[1], 3.0);
+    }
+
+    #[test]
+    fn original_data_round_trips() {
+        let data = vec![5.0, 1.0, 2.0, 4.0, 0.0, 3.0, 6.0, 7.0];
+        let tree = Tree::new(data.clone(), 4, 2, 1).expect("tree should build");
+        assert_eq!(tree.original_data(), data);
     }
 }

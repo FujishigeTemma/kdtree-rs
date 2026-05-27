@@ -1,6 +1,6 @@
 [package]
 name = "kdtree"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A minimal, high-performance KDTree for free-threaded CPython"
 license = "MIT OR Apache-2.0"

@@ -65,7 +65,6 @@ fn parse_queries<'py>(
 #[pyclass(module = "kdtree._core", frozen)]
 struct KDTree {
     tree: Tree,
-    data: Vec<f64>,
 }
 
 #[pymethods]
@@ -90,9 +89,15 @@ impl KDTree {
         let matrix = view
             .into_dimensionality::<Ix2>()
             .map_err(|_| kd_error(KDTreeError::InvalidShape("data must be a two-dimensional array")))?;
-        let original: Vec<f64> = matrix.iter().copied().collect();
-        let tree = Tree::new(matrix, leafsize).map_err(kd_error)?;
-        Ok(Self { tree, data: original })
+        let n_points = matrix.nrows();
+        let ndim = matrix.ncols();
+        let flattened: Vec<f64> = matrix.iter().copied().collect();
+        drop(readonly);
+
+        let tree = py
+            .detach(|| Tree::new(flattened, n_points, ndim, leafsize))
+            .map_err(kd_error)?;
+        Ok(Self { tree })
     }
 
     #[getter]
@@ -112,9 +117,11 @@ impl KDTree {
 
     #[getter]
     fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        let array =
-            Array2::from_shape_vec((self.tree.n_points(), self.tree.ndim()), self.data.clone())
-                .expect("tree data should be rectangular");
+        let array = Array2::from_shape_vec(
+            (self.tree.n_points(), self.tree.ndim()),
+            self.tree.original_data(),
+        )
+        .expect("tree data should be rectangular");
         PyArray2::from_owned_array(py, array)
     }
 
@@ -143,9 +150,9 @@ impl KDTree {
         parallel: bool,
     ) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let (queries, n_queries, single) = parse_queries(py, &x, self.tree.ndim())?;
-        let (distances, indices) = self
-            .tree
-            .query(&queries, k, p, max_distance, eps, parallel)
+        let tree = &self.tree;
+        let (distances, indices) = py
+            .detach(|| tree.query(&queries, k, p, max_distance, eps, parallel))
             .map_err(kd_error)?;
 
         if single {
