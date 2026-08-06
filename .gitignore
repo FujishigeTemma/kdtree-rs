@@ -3,6 +3,8 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 .pytest_cache/
+.hypothesis/
+!.hypothesis/examples/
 *.py[cod]
 
 # C extensions

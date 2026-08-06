@@ -26,11 +26,11 @@ Issues = "https://github.com/FujishigeTemma/kdtree-rs/issues"
 
 [dependency-groups]
 dev = [
+    "hypothesis==6.155.7", # newer releases require PyO3 unsupported by CPython 3.13t
     "maturin>=1.13,<2.0",
     "pytest>=9.0.3",
+    "pytest-benchmark>=5.2.3",
     "ruff>=0.15.11",
-]
-bench = [
     "scipy>=1.17.1",
 ]
 
@@ -47,4 +47,5 @@ target-version = "py313"
 select = ["E", "F", "I", "UP", "B", "RUF"]
 
 [tool.pytest.ini_options]
+addopts = "--benchmark-warmup=on --benchmark-warmup-iterations=8"
 testpaths = ["tests"]

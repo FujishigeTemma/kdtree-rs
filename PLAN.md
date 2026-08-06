@@ -163,9 +163,8 @@ SciPy の写経はしない。薄く、読みやすく、かつ用途として�
 - `python/kdtree/__init__.py`
 - `python/kdtree/_core.pyi`
 - `python/kdtree/py.typed`
-- `tests/test_api.py`
-- `tests/test_correctness.py`
-- `scripts/benchmark.py`
+- `tests/test_kdtree.py`
+- `tests/benchmark.py`
 
 ## Rust core 設計
 
@@ -322,7 +321,6 @@ SciPy との厳密互換ではなく、brute-force reference との一致を正�
 
 - 本ライブラリ
 - `scipy.spatial.KDTree`
-- `scipy.spatial.cKDTree`
 - brute-force NumPy baseline
 
 ### 測る項目

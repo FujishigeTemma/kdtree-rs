@@ -26,3 +26,10 @@ tree = KDTree(data, leafsize=32)
 
 distances, indices = tree.query(np.array([[0.2, 0.0], [2.8, 0.0]]), k=2)
 ```
+
+## Development
+
+```bash
+uv run pytest                     # property-based tests (vs SciPy as oracle)
+uv run pytest tests/benchmark.py  # benchmarks (vs SciPy)
+```
