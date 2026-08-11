@@ -57,7 +57,11 @@ fn parse_queries<'py>(
                     got: queries.shape()[1],
                 }));
             }
-            Ok((queries.iter().copied().collect(), queries.nrows(), false))
+            let flattened = match queries.as_slice() {
+                Some(slice) => slice.to_vec(),
+                None => queries.iter().copied().collect(),
+            };
+            Ok((flattened, queries.nrows(), false))
         }
         _ => Err(kd_error(KDTreeError::InvalidShape(
             "query must be one- or two-dimensional",
@@ -94,7 +98,10 @@ impl KDTree {
             .map_err(|_| kd_error(KDTreeError::InvalidShape("data must be a two-dimensional array")))?;
         let n_points = matrix.nrows();
         let ndim = matrix.ncols();
-        let flattened: Vec<f64> = matrix.iter().copied().collect();
+        let flattened: Vec<f64> = match matrix.as_slice() {
+            Some(slice) => slice.to_vec(),
+            None => matrix.iter().copied().collect(),
+        };
         drop(readonly);
 
         let tree = py
@@ -142,6 +149,7 @@ impl KDTree {
     }
 
     #[pyo3(signature = (x, *, k = 1, p = 2.0, max_distance = None, eps = 0.0, parallel = false))]
+    #[allow(clippy::too_many_arguments)] // mirrors the Python keyword API
     fn query<'py>(
         &self,
         py: Python<'py>,

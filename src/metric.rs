@@ -309,15 +309,14 @@ impl Metric {
         }
     }
 
+    /// Per-axis contribution of a non-negative axis offset.
     #[inline]
-    pub fn axis_accum(self, diff: f64) -> f64 {
+    pub fn axis_accum(self, offset: f64) -> f64 {
+        debug_assert!(offset >= 0.0);
         match self {
-            Self::L1 | Self::LInf => diff.abs(),
-            Self::L2 => {
-                let a = diff.abs();
-                a * a
-            }
-            Self::LP(p) => diff.abs().powf(p),
+            Self::L1 | Self::LInf => offset,
+            Self::L2 => offset * offset,
+            Self::LP(p) => offset.powf(p),
         }
     }
 

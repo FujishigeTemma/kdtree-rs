@@ -60,7 +60,9 @@ impl Tree {
         tree.compute_bbox_into(0, n_points, &mut scratch_lo, &mut scratch_hi);
         tree.root_lo = scratch_lo.clone();
         tree.root_hi = scratch_hi.clone();
-        let root = tree.build_node(0, n_points, &mut scratch_lo, &mut scratch_hi);
+        // The scratch buffers already hold the root bbox, so the root call
+        // skips its own O(n * ndim) recompute.
+        let root = tree.build_node(0, n_points, &mut scratch_lo, &mut scratch_hi, true);
         tree.root = root;
         tree.reorder_leaves_contiguous();
         Ok(tree)
@@ -150,12 +152,16 @@ impl Tree {
         &self.data[start * self.ndim..end * self.ndim]
     }
 
+    /// `bbox_ready` marks that `scratch_lo`/`scratch_hi` already hold the
+    /// bounding box of `[start, end)`, letting the root call reuse the pass
+    /// `new` needs anyway for `root_lo`/`root_hi`.
     fn build_node(
         &mut self,
         start: usize,
         end: usize,
         scratch_lo: &mut [f64],
         scratch_hi: &mut [f64],
+        bbox_ready: bool,
     ) -> u32 {
         let len = end - start;
         if len <= self.leafsize {
@@ -167,7 +173,9 @@ impl Tree {
             return id;
         }
 
-        self.compute_bbox_into(start, end, scratch_lo, scratch_hi);
+        if !bbox_ready {
+            self.compute_bbox_into(start, end, scratch_lo, scratch_hi);
+        }
         let split_dim = widest_dimension(scratch_lo, scratch_hi);
         let mid = start + len / 2;
         let ndim = self.ndim;
@@ -182,8 +190,8 @@ impl Tree {
         let id = self.nodes.len() as u32;
         self.nodes.push(Node::Leaf { start: 0, end: 0 }); // placeholder
 
-        let left = self.build_node(start, mid, scratch_lo, scratch_hi);
-        let right = self.build_node(mid, end, scratch_lo, scratch_hi);
+        let left = self.build_node(start, mid, scratch_lo, scratch_hi, false);
+        let right = self.build_node(mid, end, scratch_lo, scratch_hi, false);
         self.nodes[id as usize] = Node::Inner {
             left,
             right,

@@ -19,7 +19,7 @@ impl Tree {
         if k == 0 {
             return Err(KDTreeError::InvalidK);
         }
-        if queries.is_empty() || queries.len() % ndim != 0 {
+        if queries.is_empty() || !queries.len().is_multiple_of(ndim) {
             return Err(KDTreeError::InvalidShape(
                 "queries must be a contiguous row-major matrix",
             ));
@@ -36,8 +36,12 @@ impl Tree {
         }
 
         let metric = Metric::new(p)?;
-        let limit = metric.to_accum(max_distance);
-        let eps_factor = metric.eps_factor(eps);
+        let params = QueryParams {
+            k,
+            limit: metric.to_accum(max_distance),
+            eps_factor: metric.eps_factor(eps),
+            metric,
+        };
         let n_queries = queries.len() / ndim;
         let n_points = self.n_points();
 
@@ -51,7 +55,7 @@ impl Tree {
             scratch.reset();
             let q = &queries[q_idx * ndim..(q_idx + 1) * ndim];
             scratch.seed_from_root(q, self.root_bbox(), metric);
-            self.descend(self.root(), q, k, limit, eps_factor, metric, scratch);
+            self.descend(self.root(), q, &params, scratch);
             scratch.write_results(out_d, out_i, k, n_points, metric);
         };
 
@@ -82,16 +86,13 @@ impl Tree {
     /// distance from `q` to `node`'s split-cell bounding box. Per-axis
     /// contributions live in `scratch.side` and are mutated incrementally on
     /// the descent into the far child, then restored on return.
-    fn descend(
-        &self,
-        node_id: u32,
-        q: &[f64],
-        k: usize,
-        limit: f64,
-        eps_factor: f64,
-        metric: Metric,
-        scratch: &mut QueryScratch,
-    ) {
+    fn descend(&self, node_id: u32, q: &[f64], params: &QueryParams, scratch: &mut QueryScratch) {
+        let QueryParams {
+            k,
+            limit,
+            eps_factor,
+            metric,
+        } = *params;
         let upper = scratch.upper(k, limit);
         if scratch.min_dist * eps_factor > upper {
             return;
@@ -99,7 +100,7 @@ impl Tree {
 
         match *self.node(node_id) {
             Node::Leaf { start, end } => {
-                self.scan_leaf(start as usize, end as usize, q, k, limit, metric, scratch);
+                self.scan_leaf(start as usize, end as usize, q, params, scratch);
             }
             Node::Inner {
                 left,
@@ -111,7 +112,7 @@ impl Tree {
                 let diff = q[dim] - split_value;
                 let (near, far) = if diff <= 0.0 { (left, right) } else { (right, left) };
 
-                self.descend(near, q, k, limit, eps_factor, metric, scratch);
+                self.descend(near, q, params, scratch);
 
                 let new_axis = metric.axis_accum(diff.abs());
                 let old_axis = scratch.side[dim];
@@ -121,7 +122,7 @@ impl Tree {
                     let saved_min = scratch.min_dist;
                     scratch.side[dim] = new_axis;
                     scratch.min_dist = new_min;
-                    self.descend(far, q, k, limit, eps_factor, metric, scratch);
+                    self.descend(far, q, params, scratch);
                     scratch.side[dim] = old_axis;
                     scratch.min_dist = saved_min;
                 }
@@ -139,11 +140,10 @@ impl Tree {
         start: usize,
         end: usize,
         q: &[f64],
-        k: usize,
-        limit: f64,
-        metric: Metric,
+        params: &QueryParams,
         scratch: &mut QueryScratch,
     ) {
+        let &QueryParams { k, limit, metric, .. } = params;
         let block = self.leaf_block(start, end);
         let originals = self.points_indexed();
         let bound = scratch.upper(k, limit);
@@ -152,6 +152,15 @@ impl Tree {
             scratch.upper(k, limit)
         });
     }
+}
+
+/// Immutable parameters shared by every step of one `query` call.
+#[derive(Clone, Copy)]
+struct QueryParams {
+    k: usize,
+    limit: f64,
+    eps_factor: f64,
+    metric: Metric,
 }
 
 /// Per-query mutable state. Holds the k-best so far, the per-axis distance
