@@ -1,7 +1,6 @@
 use crate::error::KDTreeError;
-use crate::metric::{F64s, LANES};
 use crate::node::Node;
-use std::simd::prelude::*;
+use crate::simd::{F64s, LANES, vmax, vmin};
 
 pub struct Tree {
     data: Vec<f64>,
@@ -37,7 +36,7 @@ impl Tree {
             ));
         }
         if n_points > u32::MAX as usize {
-            return Err(KDTreeError::InvalidShape("n_points must fit in 32 bits"));
+            return Err(KDTreeError::TooManyPoints(n_points));
         }
         if !data.iter().all(|value| value.is_finite()) {
             return Err(KDTreeError::NonFiniteData);
@@ -202,20 +201,18 @@ impl Tree {
         let first = &self.data[first_base..first_base + ndim];
         lo.copy_from_slice(first);
         hi.copy_from_slice(first);
+        let (lo_chunks, lo_rest) = lo.as_chunks_mut::<LANES>();
+        let (hi_chunks, hi_rest) = hi.as_chunks_mut::<LANES>();
         for &point_index in &self.indices[start + 1..end] {
             let base = point_index as usize * ndim;
             let coords = &self.data[base..base + ndim];
-            let (lo_chunks, lo_rest) = lo.as_chunks_mut::<LANES>();
-            let (hi_chunks, hi_rest) = hi.as_chunks_mut::<LANES>();
             let (co_chunks, co_rest) = coords.as_chunks::<LANES>();
-            for ((l, h), c) in lo_chunks.iter_mut().zip(hi_chunks).zip(co_chunks) {
+            for ((l, h), c) in lo_chunks.iter_mut().zip(hi_chunks.iter_mut()).zip(co_chunks) {
                 let v = F64s::from_array(*c);
-                let cur_lo = F64s::from_array(*l);
-                let cur_hi = F64s::from_array(*h);
-                *l = v.simd_lt(cur_lo).select(v, cur_lo).to_array();
-                *h = v.simd_gt(cur_hi).select(v, cur_hi).to_array();
+                *l = vmin(v, F64s::from_array(*l)).to_array();
+                *h = vmax(v, F64s::from_array(*h)).to_array();
             }
-            for ((l, h), c) in lo_rest.iter_mut().zip(hi_rest).zip(co_rest) {
+            for ((l, h), c) in lo_rest.iter_mut().zip(hi_rest.iter_mut()).zip(co_rest) {
                 *l = l.min(*c);
                 *h = h.max(*c);
             }

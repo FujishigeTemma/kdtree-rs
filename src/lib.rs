@@ -4,6 +4,7 @@ mod error;
 mod metric;
 mod node;
 mod query;
+mod simd;
 mod tree;
 
 use ndarray::{Array2, Ix1, Ix2};

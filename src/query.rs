@@ -44,14 +44,16 @@ impl Tree {
         let mut distances = vec![0.0_f64; n_queries * k];
         let mut indices = vec![0_usize; n_queries * k];
 
-        let run =
-            |scratch: &mut QueryScratch, q_idx: usize, out_d: &mut [f64], out_i: &mut [usize]| {
-                scratch.reset();
-                let q = &queries[q_idx * ndim..(q_idx + 1) * ndim];
-                scratch.seed_from_root(q, self.root_bbox(), metric);
-                self.descend(self.root(), q, k, limit, eps_factor, metric, scratch);
-                scratch.write_results(out_d, out_i, k, n_points, metric);
-            };
+        let run = |scratch: &mut QueryScratch,
+                   q_idx: usize,
+                   out_d: &mut [f64],
+                   out_i: &mut [usize]| {
+            scratch.reset();
+            let q = &queries[q_idx * ndim..(q_idx + 1) * ndim];
+            scratch.seed_from_root(q, self.root_bbox(), metric);
+            self.descend(self.root(), q, k, limit, eps_factor, metric, scratch);
+            scratch.write_results(out_d, out_i, k, n_points, metric);
+        };
 
         if parallel && n_queries > 1 {
             distances
@@ -68,7 +70,9 @@ impl Tree {
                 .chunks_mut(k)
                 .zip(indices.chunks_mut(k))
                 .enumerate()
-                .for_each(|(q_idx, (d_chunk, i_chunk))| run(&mut scratch, q_idx, d_chunk, i_chunk));
+                .for_each(|(q_idx, (d_chunk, i_chunk))| {
+                    run(&mut scratch, q_idx, d_chunk, i_chunk)
+                });
         }
 
         Ok((distances, indices))
@@ -105,11 +109,7 @@ impl Tree {
             } => {
                 let dim = split_dim as usize;
                 let diff = q[dim] - split_value;
-                let (near, far) = if diff <= 0.0 {
-                    (left, right)
-                } else {
-                    (right, left)
-                };
+                let (near, far) = if diff <= 0.0 { (left, right) } else { (right, left) };
 
                 self.descend(near, q, k, limit, eps_factor, metric, scratch);
 
@@ -129,12 +129,10 @@ impl Tree {
         }
     }
 
-    /// Evaluate every point of a leaf against the current k-best set.
-    ///
-    /// Low dimensions take the block kernel: distances for the whole leaf
-    /// are computed branch-free (SIMD across points) and compared against
-    /// the bound in-register. Higher dimensions keep the per-point scan
-    /// whose early exit skips most of each row once the bound tightens.
+    /// Evaluate every point of a leaf against the current k-best set. The
+    /// metric owns the scan strategy (SIMD block kernels for short rows,
+    /// early-exit per-point scan otherwise); this only supplies the bound
+    /// and folds hits into the k-best buffer.
     #[inline]
     fn scan_leaf(
         &self,
@@ -148,24 +146,11 @@ impl Tree {
     ) {
         let block = self.leaf_block(start, end);
         let originals = self.points_indexed();
-        let ndim = self.ndim();
-        if metric.has_block_kernel(ndim) {
-            let bound = scratch.upper(k, limit);
-            metric.scan_block(q, block, bound, |offset, d| {
-                scratch.consider(d, originals[start + offset], k);
-                scratch.upper(k, limit)
-            });
-        } else {
-            for (offset, coords) in block.chunks_exact(ndim).enumerate() {
-                let bound = scratch.upper(k, limit);
-                let d = metric.point_accum(q, coords, bound);
-                if d > bound {
-                    continue;
-                }
-                let idx = originals[start + offset];
-                scratch.consider(d, idx, k);
-            }
-        }
+        let bound = scratch.upper(k, limit);
+        metric.scan_block(q, block, bound, |offset, d| {
+            scratch.consider(d, originals[start + offset], k);
+            scratch.upper(k, limit)
+        });
     }
 }
 

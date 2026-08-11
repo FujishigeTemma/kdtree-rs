@@ -9,6 +9,7 @@ pub enum KDTreeError {
     InvalidEps(f64),
     InvalidMaxDistance(f64),
     NonFiniteData,
+    TooManyPoints(usize),
     InvalidShape(&'static str),
     DimensionMismatch { expected: usize, got: usize },
 }
@@ -30,6 +31,9 @@ impl fmt::Display for KDTreeError {
                 )
             }
             Self::NonFiniteData => write!(f, "all coordinates must be finite"),
+            Self::TooManyPoints(n) => {
+                write!(f, "n_points must fit in a 32-bit index, got {n}")
+            }
             Self::InvalidShape(message) => write!(f, "{message}"),
             Self::DimensionMismatch { expected, got } => {
                 write!(f, "dimension mismatch: expected {expected}, got {got}")
