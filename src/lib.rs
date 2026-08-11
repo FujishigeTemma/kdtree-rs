@@ -1,11 +1,11 @@
 #![feature(portable_simd)]
 
-mod error;
+pub mod error;
 mod metric;
 mod node;
 mod query;
 mod simd;
-mod tree;
+pub mod tree;
 
 use ndarray::{Array2, Ix1, Ix2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArrayDyn};
@@ -21,6 +21,11 @@ fn kd_error(err: KDTreeError) -> PyErr {
 }
 
 fn as_numpy_f64<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    // Fast path: already an f64 ndarray — skip the Python-level
+    // `numpy.asarray` round-trip entirely.
+    if obj.extract::<PyReadonlyArrayDyn<'_, f64>>().is_ok() {
+        return Ok(obj.clone());
+    }
     let numpy = py.import("numpy")?;
     let kwargs = [("dtype", numpy.getattr("float64")?)].into_py_dict(py)?;
     numpy.call_method("asarray", (obj,), Some(&kwargs))
@@ -159,11 +164,9 @@ impl KDTree {
             .detach(|| tree.query(&queries, k, p, max_distance, eps, parallel))
             .map_err(kd_error)?;
 
-        let indices_i64: Vec<i64> = indices.into_iter().map(|i| i as i64).collect();
-
         if single {
             let py_distances = PyArray1::from_vec(py, distances).into_any().unbind();
-            let py_indices = PyArray1::from_vec(py, indices_i64).into_any().unbind();
+            let py_indices = PyArray1::from_vec(py, indices).into_any().unbind();
             Ok((py_distances, py_indices))
         } else {
             let py_distances = PyArray2::from_owned_array(
@@ -174,7 +177,7 @@ impl KDTree {
             .unbind();
             let py_indices = PyArray2::from_owned_array(
                 py,
-                Array2::from_shape_vec((n_queries, k), indices_i64).expect("shape should match"),
+                Array2::from_shape_vec((n_queries, k), indices).expect("shape should match"),
             )
             .into_any()
             .unbind();

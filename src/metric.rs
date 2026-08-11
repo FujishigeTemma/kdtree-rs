@@ -337,4 +337,63 @@ impl Metric {
             _ => total - old_axis + new_axis,
         }
     }
+
+    /// Accumulated distance from `q` to the axis-aligned box `[lo, hi]`:
+    /// zero when `q` is inside. Comparable against the same accumulator
+    /// domain as `point_accum` (squared for L2, p-th power for L^p).
+    #[inline]
+    pub fn bbox_accum(self, q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
+        match self {
+            Self::L1 | Self::L2 => self.bbox_accum_sum(q, lo, hi),
+            Self::LInf => Self::bbox_accum_linf(q, lo, hi),
+            Self::LP(p) => Self::bbox_accum_lp(p, q, lo, hi),
+        }
+    }
+
+    fn bbox_accum_sum(self, q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
+        let (q_chunks, q_rest) = q.as_chunks::<LANES>();
+        let (lo_chunks, lo_rest) = lo.as_chunks::<LANES>();
+        let (hi_chunks, hi_rest) = hi.as_chunks::<LANES>();
+        let zero = F64s::splat(0.0);
+        let mut acc = zero;
+        for ((qc, lc), hc) in q_chunks.iter().zip(lo_chunks).zip(hi_chunks) {
+            let qv = F64s::from_array(*qc);
+            let off = vmax(
+                vmax(F64s::from_array(*lc) - qv, qv - F64s::from_array(*hc)),
+                zero,
+            );
+            acc += self.axes_lanes(off);
+        }
+        let mut total = if q_chunks.is_empty() { 0.0 } else { hsum(acc) };
+        for ((&qs, &ls), &hs) in q_rest.iter().zip(lo_rest).zip(hi_rest) {
+            let off = (ls - qs).max(qs - hs).max(0.0);
+            total += match self {
+                Self::L2 => off * off,
+                _ => off,
+            };
+        }
+        total
+    }
+
+    fn bbox_accum_linf(q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
+        let mut worst = 0.0_f64;
+        for ((&qs, &ls), &hs) in q.iter().zip(lo).zip(hi) {
+            let off = (ls - qs).max(qs - hs);
+            if off > worst {
+                worst = off;
+            }
+        }
+        worst
+    }
+
+    fn bbox_accum_lp(p: f64, q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
+        let mut total = 0.0_f64;
+        for ((&qs, &ls), &hs) in q.iter().zip(lo).zip(hi) {
+            let off = (ls - qs).max(qs - hs).max(0.0);
+            if off > 0.0 {
+                total += off.powf(p);
+            }
+        }
+        total
+    }
 }
