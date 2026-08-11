@@ -37,7 +37,6 @@ impl Tree {
 
         let metric = Metric::new(p)?;
         let params = QueryParams {
-            k,
             limit: metric.to_accum(max_distance),
             eps_factor: metric.eps_factor(eps),
             metric,
@@ -56,7 +55,7 @@ impl Tree {
             let q = &queries[q_idx * ndim..(q_idx + 1) * ndim];
             scratch.seed_from_root(q, self.root_bbox(), metric);
             self.descend(self.root(), q, &params, scratch);
-            scratch.write_results(out_d, out_i, k, n_points, metric);
+            scratch.write_results(out_d, out_i, n_points, metric);
         };
 
         if parallel && n_queries > 1 {
@@ -88,12 +87,11 @@ impl Tree {
     /// the descent into the far child, then restored on return.
     fn descend(&self, node_id: u32, q: &[f64], params: &QueryParams, scratch: &mut QueryScratch) {
         let QueryParams {
-            k,
             limit,
             eps_factor,
             metric,
         } = *params;
-        let upper = scratch.upper(k, limit);
+        let upper = scratch.upper(limit);
         if scratch.min_dist * eps_factor > upper {
             return;
         }
@@ -117,7 +115,7 @@ impl Tree {
                 let new_axis = metric.axis_accum(diff.abs());
                 let old_axis = scratch.side[dim];
                 let new_min = metric.replace_axis(scratch.min_dist, old_axis, new_axis);
-                let upper = scratch.upper(k, limit);
+                let upper = scratch.upper(limit);
                 if new_min * eps_factor <= upper {
                     let saved_min = scratch.min_dist;
                     scratch.side[dim] = new_axis;
@@ -143,13 +141,13 @@ impl Tree {
         params: &QueryParams,
         scratch: &mut QueryScratch,
     ) {
-        let &QueryParams { k, limit, metric, .. } = params;
+        let &QueryParams { limit, metric, .. } = params;
         let block = self.leaf_block(start, end);
         let originals = self.points_indexed();
-        let bound = scratch.upper(k, limit);
+        let bound = scratch.upper(limit);
         metric.scan_block(q, block, bound, |offset, d| {
-            scratch.consider(d, originals[start + offset], k);
-            scratch.upper(k, limit)
+            scratch.consider(d, originals[start + offset]);
+            scratch.upper(limit)
         });
     }
 }
@@ -157,7 +155,6 @@ impl Tree {
 /// Immutable parameters shared by every step of one `query` call.
 #[derive(Clone, Copy)]
 struct QueryParams {
-    k: usize,
     limit: f64,
     eps_factor: f64,
     metric: Metric,
@@ -167,6 +164,7 @@ struct QueryParams {
 /// contribution of the current cell, and the current cell's accumulated
 /// L^p lower bound.
 struct QueryScratch {
+    k: usize,
     nb_d: Vec<f64>,
     nb_i: Vec<u32>,
     side: Vec<f64>,
@@ -176,6 +174,7 @@ struct QueryScratch {
 impl QueryScratch {
     fn new(ndim: usize, k: usize) -> Self {
         Self {
+            k,
             nb_d: Vec::with_capacity(k),
             nb_i: Vec::with_capacity(k),
             side: vec![0.0; ndim],
@@ -210,21 +209,21 @@ impl QueryScratch {
     }
 
     #[inline]
-    fn upper(&self, k: usize, limit: f64) -> f64 {
-        if self.nb_d.len() < k {
+    fn upper(&self, limit: f64) -> f64 {
+        if self.nb_d.len() < self.k {
             limit
         } else {
-            self.nb_d[k - 1].min(limit)
+            self.nb_d[self.k - 1].min(limit)
         }
     }
 
     /// Insert `(d, idx)` into the sorted k-best buffer. Ties are resolved by
     /// smaller original index, matching `numpy.argsort(kind="stable")`.
     #[inline]
-    fn consider(&mut self, d: f64, idx: u32, k: usize) {
-        if self.nb_d.len() == k {
-            let worst_d = self.nb_d[k - 1];
-            if d > worst_d || (d == worst_d && self.nb_i[k - 1] <= idx) {
+    fn consider(&mut self, d: f64, idx: u32) {
+        if self.nb_d.len() == self.k {
+            let worst_d = self.nb_d[self.k - 1];
+            if d > worst_d || (d == worst_d && self.nb_i[self.k - 1] <= idx) {
                 return;
             }
             self.nb_d.pop();
@@ -242,15 +241,8 @@ impl QueryScratch {
         self.nb_i.insert(pos, idx);
     }
 
-    fn write_results(
-        &self,
-        out_d: &mut [f64],
-        out_i: &mut [usize],
-        k: usize,
-        n_points: usize,
-        metric: Metric,
-    ) {
-        for j in 0..k {
+    fn write_results(&self, out_d: &mut [f64], out_i: &mut [usize], n_points: usize, metric: Metric) {
+        for j in 0..out_d.len() {
             if j < self.nb_d.len() {
                 out_d[j] = metric.finish(self.nb_d[j]);
                 out_i[j] = self.nb_i[j] as usize;
@@ -271,7 +263,7 @@ mod tests {
     #[test]
     fn query_returns_exact_nearest_neighbors() {
         let data = vec![0.0, 0.0, 2.0, 0.0, 4.0, 0.0, 5.0, 0.0];
-        let tree = Tree::new(data, 4, 2, 2).expect("tree should build");
+        let tree = Tree::new(data, 2, 2).expect("tree should build");
 
         let (distances, indices) = tree
             .query(&[1.5, 0.0], 2, 2.0, None, 0.0, false)
@@ -285,7 +277,7 @@ mod tests {
     #[test]
     fn query_pads_missing_neighbors() {
         let data = vec![0.0, 0.0, 10.0, 0.0];
-        let tree = Tree::new(data, 2, 2, 1).expect("tree should build");
+        let tree = Tree::new(data, 2, 1).expect("tree should build");
 
         let (distances, indices) = tree
             .query(&[0.0, 0.0, 11.0, 0.0], 3, 2.0, Some(2.0), 0.0, false)

@@ -15,26 +15,22 @@ pub struct Tree {
 }
 
 impl Tree {
-    /// Build a tree from a row-major `Vec<f64>` of length `n_points * ndim`.
+    /// Build a tree from a row-major `Vec<f64>` of `ndim`-wide points.
     /// Takes the data by value so the caller can release any Python borrow
     /// before invoking us and we can run under `py.detach`.
-    pub fn new(
-        data: Vec<f64>,
-        n_points: usize,
-        ndim: usize,
-        leafsize: usize,
-    ) -> Result<Self, KDTreeError> {
+    pub fn new(data: Vec<f64>, ndim: usize, leafsize: usize) -> Result<Self, KDTreeError> {
         if leafsize == 0 {
             return Err(KDTreeError::InvalidLeafsize);
         }
-        if n_points == 0 || ndim == 0 {
+        if ndim == 0 || data.is_empty() {
             return Err(KDTreeError::EmptyData);
         }
-        if data.len() != n_points * ndim {
+        if !data.len().is_multiple_of(ndim) {
             return Err(KDTreeError::InvalidShape(
-                "data length must equal n_points * ndim",
+                "data length must be a multiple of ndim",
             ));
         }
+        let n_points = data.len() / ndim;
         if n_points > u32::MAX as usize {
             return Err(KDTreeError::TooManyPoints(n_points));
         }
@@ -60,8 +56,6 @@ impl Tree {
         tree.compute_bbox_into(0, n_points, &mut scratch_lo, &mut scratch_hi);
         tree.root_lo = scratch_lo.clone();
         tree.root_hi = scratch_hi.clone();
-        // The scratch buffers already hold the root bbox, so the root call
-        // skips its own O(n * ndim) recompute.
         let root = tree.build_node(0, n_points, &mut scratch_lo, &mut scratch_hi, true);
         tree.root = root;
         tree.reorder_leaves_contiguous();
@@ -249,14 +243,14 @@ mod tests {
 
     #[test]
     fn build_rejects_empty_inputs() {
-        let result = Tree::new(Vec::new(), 0, 2, 32);
+        let result = Tree::new(Vec::new(), 2, 32);
         assert!(result.is_err());
     }
 
     #[test]
     fn build_preserves_shape_information() {
         let data = vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
-        let tree = Tree::new(data, 4, 2, 2).expect("tree should build");
+        let tree = Tree::new(data, 2, 2).expect("tree should build");
 
         assert_eq!(tree.n_points(), 4);
         assert_eq!(tree.ndim(), 2);
@@ -271,7 +265,7 @@ mod tests {
     #[test]
     fn original_data_round_trips() {
         let data = vec![5.0, 1.0, 2.0, 4.0, 0.0, 3.0, 6.0, 7.0];
-        let tree = Tree::new(data.clone(), 4, 2, 1).expect("tree should build");
+        let tree = Tree::new(data.clone(), 2, 1).expect("tree should build");
         assert_eq!(tree.original_data(), data);
     }
 
@@ -283,7 +277,7 @@ mod tests {
         let data: Vec<f64> = (0..n * ndim).map(|i| (i as f64) * 0.001).collect();
 
         let info = allocation_counter::measure(move || {
-            Tree::new(data, n, ndim, leafsize).expect("tree should build");
+            Tree::new(data, ndim, leafsize).expect("tree should build");
         });
 
         assert!(

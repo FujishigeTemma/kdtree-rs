@@ -148,11 +148,7 @@ impl Metric {
                     }
                 }
             }
-            Self::LP(p) => {
-                for (a, b) in lhs.iter().zip(rhs) {
-                    acc += (a - b).abs().powf(p);
-                }
-            }
+            Self::LP(_) => unreachable!("LP accumulates only in point_accum_lp"),
         }
         acc
     }

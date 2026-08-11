@@ -77,14 +77,8 @@ struct KDTree {
 #[pymethods]
 impl KDTree {
     #[new]
-    #[pyo3(signature = (data, *, leafsize = 32, copy_data = false))]
-    fn new(
-        py: Python<'_>,
-        data: Bound<'_, PyAny>,
-        leafsize: usize,
-        copy_data: bool,
-    ) -> PyResult<Self> {
-        let _ = copy_data;
+    #[pyo3(signature = (data, *, leafsize = 32))]
+    fn new(py: Python<'_>, data: Bound<'_, PyAny>, leafsize: usize) -> PyResult<Self> {
         let array = as_numpy_f64(py, &data)?;
         let readonly = array.extract::<PyReadonlyArrayDyn<'_, f64>>()?;
         let view = readonly.as_array();
@@ -96,7 +90,6 @@ impl KDTree {
         let matrix = view
             .into_dimensionality::<Ix2>()
             .map_err(|_| kd_error(KDTreeError::InvalidShape("data must be a two-dimensional array")))?;
-        let n_points = matrix.nrows();
         let ndim = matrix.ncols();
         let flattened: Vec<f64> = match matrix.as_slice() {
             Some(slice) => slice.to_vec(),
@@ -105,7 +98,7 @@ impl KDTree {
         drop(readonly);
 
         let tree = py
-            .detach(|| Tree::new(flattened, n_points, ndim, leafsize))
+            .detach(|| Tree::new(flattened, ndim, leafsize))
             .map_err(kd_error)?;
         Ok(Self { tree })
     }
