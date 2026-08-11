@@ -1,9 +1,11 @@
 use crate::error::KDTreeError;
+use crate::metric::{F64s, LANES};
 use crate::node::Node;
+use std::simd::prelude::*;
 
 pub struct Tree {
     data: Vec<f64>,
-    indices: Vec<usize>,
+    indices: Vec<u32>,
     nodes: Vec<Node>,
     root_lo: Vec<f64>,
     root_hi: Vec<f64>,
@@ -34,11 +36,14 @@ impl Tree {
                 "data length must equal n_points * ndim",
             ));
         }
+        if n_points > u32::MAX as usize {
+            return Err(KDTreeError::InvalidShape("n_points must fit in 32 bits"));
+        }
         if !data.iter().all(|value| value.is_finite()) {
             return Err(KDTreeError::NonFiniteData);
         }
 
-        let indices = (0..n_points).collect::<Vec<_>>();
+        let indices = (0..n_points as u32).collect::<Vec<_>>();
 
         let mut tree = Self {
             data,
@@ -69,7 +74,7 @@ impl Tree {
         let mut original = vec![0.0_f64; self.n_points * self.ndim];
         for (pos, &original_idx) in self.indices.iter().enumerate() {
             let src = pos * self.ndim;
-            let dst = original_idx * self.ndim;
+            let dst = original_idx as usize * self.ndim;
             original[dst..dst + self.ndim].copy_from_slice(&self.data[src..src + self.ndim]);
         }
         original
@@ -79,13 +84,36 @@ impl Tree {
     /// tree-position order. After this, `self.data[pos * ndim ..]` is the
     /// point at tree position `pos`, and `self.indices[pos]` is that point's
     /// original data index. Subsequent queries iterate leaves sequentially.
+    ///
+    /// The permutation is applied in place by walking its cycles, so build
+    /// peak memory stays at one copy of the data (plus one row buffer and a
+    /// one-byte-per-point visited map) instead of two.
     fn reorder_leaves_contiguous(&mut self) {
-        let mut reordered = Vec::with_capacity(self.data.len());
-        for &original in &self.indices {
-            let start = original * self.ndim;
-            reordered.extend_from_slice(&self.data[start..start + self.ndim]);
+        let ndim = self.ndim;
+        let mut visited = vec![false; self.n_points];
+        let mut row = vec![0.0_f64; ndim];
+        for cycle_start in 0..self.n_points {
+            if visited[cycle_start] {
+                continue;
+            }
+            visited[cycle_start] = true;
+            if self.indices[cycle_start] as usize == cycle_start {
+                continue;
+            }
+            row.copy_from_slice(&self.data[cycle_start * ndim..(cycle_start + 1) * ndim]);
+            let mut dst = cycle_start;
+            loop {
+                let src = self.indices[dst] as usize;
+                if src == cycle_start {
+                    self.data[dst * ndim..(dst + 1) * ndim].copy_from_slice(&row);
+                    break;
+                }
+                self.data
+                    .copy_within(src * ndim..(src + 1) * ndim, dst * ndim);
+                visited[src] = true;
+                dst = src;
+            }
         }
-        self.data = reordered;
     }
 
     pub fn ndim(&self) -> usize {
@@ -108,7 +136,7 @@ impl Tree {
         &self.nodes[index as usize]
     }
 
-    pub(crate) fn points_indexed(&self) -> &[usize] {
+    pub(crate) fn points_indexed(&self) -> &[u32] {
         &self.indices
     }
 
@@ -146,11 +174,11 @@ impl Tree {
         let ndim = self.ndim;
         let data = &self.data;
         self.indices[start..end].select_nth_unstable_by(mid - start, |lhs, rhs| {
-            let lhs_value = data[*lhs * ndim + split_dim];
-            let rhs_value = data[*rhs * ndim + split_dim];
+            let lhs_value = data[*lhs as usize * ndim + split_dim];
+            let rhs_value = data[*rhs as usize * ndim + split_dim];
             lhs_value.total_cmp(&rhs_value)
         });
-        let split_value = self.data[self.indices[mid] * ndim + split_dim];
+        let split_value = self.data[self.indices[mid] as usize * ndim + split_dim];
 
         let id = self.nodes.len() as u32;
         self.nodes.push(Node::Leaf { start: 0, end: 0 }); // placeholder
@@ -170,16 +198,26 @@ impl Tree {
         let ndim = self.ndim;
         let lo = &mut lo[..ndim];
         let hi = &mut hi[..ndim];
-        let first_base = self.indices[start] * ndim;
+        let first_base = self.indices[start] as usize * ndim;
         let first = &self.data[first_base..first_base + ndim];
         lo.copy_from_slice(first);
         hi.copy_from_slice(first);
         for &point_index in &self.indices[start + 1..end] {
-            let base = point_index * ndim;
+            let base = point_index as usize * ndim;
             let coords = &self.data[base..base + ndim];
-            for dim in 0..ndim {
-                lo[dim] = lo[dim].min(coords[dim]);
-                hi[dim] = hi[dim].max(coords[dim]);
+            let (lo_chunks, lo_rest) = lo.as_chunks_mut::<LANES>();
+            let (hi_chunks, hi_rest) = hi.as_chunks_mut::<LANES>();
+            let (co_chunks, co_rest) = coords.as_chunks::<LANES>();
+            for ((l, h), c) in lo_chunks.iter_mut().zip(hi_chunks).zip(co_chunks) {
+                let v = F64s::from_array(*c);
+                let cur_lo = F64s::from_array(*l);
+                let cur_hi = F64s::from_array(*h);
+                *l = v.simd_lt(cur_lo).select(v, cur_lo).to_array();
+                *h = v.simd_gt(cur_hi).select(v, cur_hi).to_array();
+            }
+            for ((l, h), c) in lo_rest.iter_mut().zip(hi_rest).zip(co_rest) {
+                *l = l.min(*c);
+                *h = h.max(*c);
             }
         }
     }

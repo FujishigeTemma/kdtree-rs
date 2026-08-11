@@ -44,16 +44,14 @@ impl Tree {
         let mut distances = vec![0.0_f64; n_queries * k];
         let mut indices = vec![0_usize; n_queries * k];
 
-        let run = |scratch: &mut QueryScratch,
-                   q_idx: usize,
-                   out_d: &mut [f64],
-                   out_i: &mut [usize]| {
-            scratch.reset();
-            let q = &queries[q_idx * ndim..(q_idx + 1) * ndim];
-            scratch.seed_from_root(q, self.root_bbox(), metric);
-            self.descend(self.root(), q, k, limit, eps_factor, metric, scratch);
-            scratch.write_results(out_d, out_i, k, n_points, metric);
-        };
+        let run =
+            |scratch: &mut QueryScratch, q_idx: usize, out_d: &mut [f64], out_i: &mut [usize]| {
+                scratch.reset();
+                let q = &queries[q_idx * ndim..(q_idx + 1) * ndim];
+                scratch.seed_from_root(q, self.root_bbox(), metric);
+                self.descend(self.root(), q, k, limit, eps_factor, metric, scratch);
+                scratch.write_results(out_d, out_i, k, n_points, metric);
+            };
 
         if parallel && n_queries > 1 {
             distances
@@ -70,9 +68,7 @@ impl Tree {
                 .chunks_mut(k)
                 .zip(indices.chunks_mut(k))
                 .enumerate()
-                .for_each(|(q_idx, (d_chunk, i_chunk))| {
-                    run(&mut scratch, q_idx, d_chunk, i_chunk)
-                });
+                .for_each(|(q_idx, (d_chunk, i_chunk))| run(&mut scratch, q_idx, d_chunk, i_chunk));
         }
 
         Ok((distances, indices))
@@ -109,7 +105,11 @@ impl Tree {
             } => {
                 let dim = split_dim as usize;
                 let diff = q[dim] - split_value;
-                let (near, far) = if diff <= 0.0 { (left, right) } else { (right, left) };
+                let (near, far) = if diff <= 0.0 {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
 
                 self.descend(near, q, k, limit, eps_factor, metric, scratch);
 
@@ -129,6 +129,12 @@ impl Tree {
         }
     }
 
+    /// Evaluate every point of a leaf against the current k-best set.
+    ///
+    /// Low dimensions take the block kernel: distances for the whole leaf
+    /// are computed branch-free (SIMD across points) and compared against
+    /// the bound in-register. Higher dimensions keep the per-point scan
+    /// whose early exit skips most of each row once the bound tightens.
     #[inline]
     fn scan_leaf(
         &self,
@@ -143,14 +149,22 @@ impl Tree {
         let block = self.leaf_block(start, end);
         let originals = self.points_indexed();
         let ndim = self.ndim();
-        for (offset, coords) in block.chunks_exact(ndim).enumerate() {
+        if metric.has_block_kernel(ndim) {
             let bound = scratch.upper(k, limit);
-            let d = metric.point_accum(q, coords, bound);
-            if d > bound {
-                continue;
+            metric.scan_block(q, block, bound, |offset, d| {
+                scratch.consider(d, originals[start + offset], k);
+                scratch.upper(k, limit)
+            });
+        } else {
+            for (offset, coords) in block.chunks_exact(ndim).enumerate() {
+                let bound = scratch.upper(k, limit);
+                let d = metric.point_accum(q, coords, bound);
+                if d > bound {
+                    continue;
+                }
+                let idx = originals[start + offset];
+                scratch.consider(d, idx, k);
             }
-            let idx = originals[start + offset];
-            scratch.consider(d, idx, k);
         }
     }
 }
@@ -160,7 +174,7 @@ impl Tree {
 /// L^p lower bound.
 struct QueryScratch {
     nb_d: Vec<f64>,
-    nb_i: Vec<usize>,
+    nb_i: Vec<u32>,
     side: Vec<f64>,
     min_dist: f64,
 }
@@ -213,7 +227,7 @@ impl QueryScratch {
     /// Insert `(d, idx)` into the sorted k-best buffer. Ties are resolved by
     /// smaller original index, matching `numpy.argsort(kind="stable")`.
     #[inline]
-    fn consider(&mut self, d: f64, idx: usize, k: usize) {
+    fn consider(&mut self, d: f64, idx: u32, k: usize) {
         if self.nb_d.len() == k {
             let worst_d = self.nb_d[k - 1];
             if d > worst_d || (d == worst_d && self.nb_i[k - 1] <= idx) {
@@ -245,7 +259,7 @@ impl QueryScratch {
         for j in 0..k {
             if j < self.nb_d.len() {
                 out_d[j] = metric.finish(self.nb_d[j]);
-                out_i[j] = self.nb_i[j];
+                out_i[j] = self.nb_i[j] as usize;
             } else {
                 out_d[j] = f64::INFINITY;
                 out_i[j] = n_points;

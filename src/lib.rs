@@ -1,3 +1,5 @@
+#![feature(portable_simd)]
+
 mod error;
 mod metric;
 mod node;
