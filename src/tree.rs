@@ -328,10 +328,14 @@ fn build_range<const D: usize>(
     );
 }
 
-/// Three-way (Dutch national flag) partition of whole rows around `pivot` on
-/// `split_dim`: rows with smaller keys move before `mid`, larger keys after,
-/// and pivot-equal rows fill the middle so the boundary lands exactly at
-/// `mid` no matter how many duplicates exist.
+/// Partition whole rows around `pivot` on `split_dim` so that rows before
+/// `mid` have keys `<= pivot` and rows from `mid` on have keys `>= pivot`,
+/// no matter how many duplicates exist.
+///
+/// A Hoare-style two-pointer pass on `< pivot` swaps only misplaced pairs
+/// (a Dutch-flag loop moves ~3x as many rows), then a fix-up walk pulls
+/// pivot-equal rows into the `[lt, mid)` gap — a no-op when the pivot is
+/// unique and already adjacent, the common case.
 fn partition_rows<const D: usize>(
     data: &mut [f64],
     indices: &mut [u32],
@@ -342,25 +346,38 @@ fn partition_rows<const D: usize>(
 ) {
     debug_assert_eq!(data.len(), indices.len() * ndim);
     debug_assert!(D == 0 || D == ndim);
-    let mut lt = 0;
+    let len = indices.len();
     let mut i = 0;
-    let mut gt = indices.len();
-    while i < gt {
-        let key = data[i * ndim + split_dim];
-        if key < pivot {
-            swap_rows::<D>(data, ndim, i, lt);
-            indices.swap(i, lt);
-            lt += 1;
-            i += 1;
-        } else if key > pivot {
-            gt -= 1;
-            swap_rows::<D>(data, ndim, i, gt);
-            indices.swap(i, gt);
-        } else {
+    let mut j = len;
+    loop {
+        while i < j && data[i * ndim + split_dim] < pivot {
             i += 1;
         }
+        while i < j && data[(j - 1) * ndim + split_dim] >= pivot {
+            j -= 1;
+        }
+        if i >= j {
+            break;
+        }
+        j -= 1;
+        swap_rows::<D>(data, ndim, i, j);
+        indices.swap(i, j);
+        i += 1;
     }
-    debug_assert!(lt <= mid && mid <= gt);
+    // `[0, i)` holds every `< pivot` row; the mid-th order statistic being
+    // `pivot` guarantees enough pivot-equal rows in the tail to fill up to
+    // `mid`.
+    let mut place = i;
+    let mut scan = i;
+    while place < mid {
+        debug_assert!(scan < len);
+        if data[scan * ndim + split_dim] == pivot {
+            swap_rows::<D>(data, ndim, scan, place);
+            indices.swap(scan, place);
+            place += 1;
+        }
+        scan += 1;
+    }
 }
 
 /// Swap two full rows. With a compile-time width the copy fully unrolls;
