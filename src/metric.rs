@@ -366,11 +366,7 @@ impl Metric {
         }
         let mut total = if q_chunks.is_empty() { 0.0 } else { hsum(acc) };
         for ((&qs, &ls), &hs) in q_rest.iter().zip(lo_rest).zip(hi_rest) {
-            let off = (ls - qs).max(qs - hs).max(0.0);
-            total += match self {
-                Self::L2 => off * off,
-                _ => off,
-            };
+            total += self.axis_accum(box_axis_offset(qs, ls, hs));
         }
         total
     }
@@ -378,7 +374,7 @@ impl Metric {
     fn bbox_accum_linf(q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
         let mut worst = 0.0_f64;
         for ((&qs, &ls), &hs) in q.iter().zip(lo).zip(hi) {
-            let off = (ls - qs).max(qs - hs);
+            let off = box_axis_offset(qs, ls, hs);
             if off > worst {
                 worst = off;
             }
@@ -389,11 +385,19 @@ impl Metric {
     fn bbox_accum_lp(p: f64, q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
         let mut total = 0.0_f64;
         for ((&qs, &ls), &hs) in q.iter().zip(lo).zip(hi) {
-            let off = (ls - qs).max(qs - hs).max(0.0);
+            let off = box_axis_offset(qs, ls, hs);
             if off > 0.0 {
                 total += off.powf(p);
             }
         }
         total
     }
+}
+
+/// Per-axis offset from a coordinate to the interval `[lo, hi]`: zero
+/// inside. All box-distance bounds in the crate go through this one clamp so
+/// they agree bit-for-bit.
+#[inline(always)]
+pub fn box_axis_offset(q: f64, lo: f64, hi: f64) -> f64 {
+    (lo - q).max(q - hi).max(0.0)
 }

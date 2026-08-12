@@ -47,15 +47,22 @@ pub(crate) fn hmax(v: F64s) -> f64 {
     if m2[1] > m2[0] { m2[1] } else { m2[0] }
 }
 
-/// Vectorized finiteness sweep: `v * 0 != 0` exactly for infinities and
-/// NaNs, so one multiply-compare per vector replaces per-element
+/// Lanes holding a non-finite value: `v * 0 != 0` exactly for infinities
+/// and NaNs, so one multiply-compare per vector replaces per-element
 /// `is_finite` branches.
+#[inline(always)]
+pub(crate) fn nonfinite_lanes(v: F64s) -> Mask<i64, LANES> {
+    let zero = F64s::splat(0.0);
+    (v * zero).simd_ne(zero)
+}
+
+/// Vectorized finiteness sweep over a whole slice.
 pub(crate) fn all_finite(values: &[f64]) -> bool {
     let zero = F64s::splat(0.0);
     let mut nonfinite = zero.simd_ne(zero);
     let (chunks, rest) = values.as_chunks::<LANES>();
     for c in chunks {
-        nonfinite |= (F64s::from_array(*c) * zero).simd_ne(zero);
+        nonfinite |= nonfinite_lanes(F64s::from_array(*c));
     }
     !nonfinite.any() && rest.iter().all(|v| v.is_finite())
 }

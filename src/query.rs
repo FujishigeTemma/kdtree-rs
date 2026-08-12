@@ -1,9 +1,9 @@
 use rayon::prelude::*;
 
 use crate::error::KDTreeError;
-use crate::metric::Metric;
-use crate::node::{Node, ORDER_BY_BOX};
-use crate::tree::Tree;
+use crate::metric::{Metric, box_axis_offset};
+use crate::node::{Node, unpack_split};
+use crate::tree::{ROOT, Tree};
 
 /// Minimum queries per rayon task. Each query can be well under a
 /// microsecond, so without a floor the per-task overhead of a
@@ -82,14 +82,17 @@ impl Tree {
             let q = &queries[q_idx * ndim..(q_idx + 1) * ndim];
             let (lo, hi) = self.root_bbox();
             // Fast path: queries inside the root box (the overwhelmingly
-            // common case) need no per-axis seed at all.
+            // common case) need no per-axis seed at all — `cell` upholds
+            // "all zeros between queries", which is exactly the seed.
             if metric.bbox_accum(q, lo, hi) == 0.0 {
-                cell.reset_zero();
+                cell.min_dist = 0.0;
+                self.descend(ROOT, q, params, cell, best);
             } else {
                 cell.seed_from_root(q, (lo, hi), metric);
-            }
-            if cell.min_dist * params.eps_factor <= best.upper(params.limit) {
-                self.descend(0, q, params, cell, best);
+                if cell.min_dist * params.eps_factor <= params.limit {
+                    self.descend(ROOT, q, params, cell, best);
+                }
+                cell.clear();
             }
             best.write_results(out_d, out_i, n_points, metric);
         };
@@ -148,7 +151,7 @@ impl Tree {
                 split_dim,
                 split_value,
             } => {
-                let dim = (split_dim & !ORDER_BY_BOX) as usize;
+                let (dim, order_by_box) = unpack_split(split_dim);
                 let diff = q[dim] - split_value;
                 let (near, far) = if diff <= 0.0 { (left, right) } else { (right, left) };
 
@@ -156,7 +159,7 @@ impl Tree {
                 let old_axis = cell.side[dim];
                 let new_min = metric.replace_axis(cell.min_dist, old_axis, new_axis);
 
-                if split_dim & ORDER_BY_BOX != 0 {
+                if order_by_box {
                     self.descend_box_ordered(
                         near, far, dim, new_axis, old_axis, new_min, q, params, cell, best,
                     );
@@ -169,12 +172,7 @@ impl Tree {
                 if new_min * eps_factor <= upper {
                     let (far_lo, far_hi) = self.node_bbox(far);
                     if metric.bbox_accum(q, far_lo, far_hi) * eps_factor <= upper {
-                        let saved_min = cell.min_dist;
-                        cell.side[dim] = new_axis;
-                        cell.min_dist = new_min;
-                        self.descend(far, q, params, cell, best);
-                        cell.side[dim] = old_axis;
-                        cell.min_dist = saved_min;
+                        self.enter_far(far, dim, new_axis, old_axis, new_min, q, params, cell, best);
                     }
                 }
             }
@@ -211,29 +209,46 @@ impl Tree {
         let (f_lo, f_hi) = self.node_bbox(far);
         let d_far = metric.bbox_accum(q, f_lo, f_hi);
 
-        let visit_far = |cell: &mut DescentState, best: &mut B| {
-            let saved_min = cell.min_dist;
-            cell.side[dim] = new_axis;
-            cell.min_dist = new_min;
-            self.descend(far, q, params, cell, best);
-            cell.side[dim] = old_axis;
-            cell.min_dist = saved_min;
-        };
         if d_near <= d_far {
             if d_near * eps_factor <= best.upper(limit) {
                 self.descend(near, q, params, cell, best);
             }
             if d_far * eps_factor <= best.upper(limit) {
-                visit_far(cell, best);
+                self.enter_far(far, dim, new_axis, old_axis, new_min, q, params, cell, best);
             }
         } else {
             if d_far * eps_factor <= best.upper(limit) {
-                visit_far(cell, best);
+                self.enter_far(far, dim, new_axis, old_axis, new_min, q, params, cell, best);
             }
             if d_near * eps_factor <= best.upper(limit) {
                 self.descend(near, q, params, cell, best);
             }
         }
+    }
+
+    /// Enter the plane-far child: apply the far side's axis contribution to
+    /// the incremental cell state, descend, and restore. The one place that
+    /// owns the save/restore protocol of `DescentState`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn enter_far<B: Best>(
+        &self,
+        far: u32,
+        dim: usize,
+        new_axis: f64,
+        old_axis: f64,
+        new_min: f64,
+        q: &[f64],
+        params: &QueryParams,
+        cell: &mut DescentState,
+        best: &mut B,
+    ) {
+        let saved_min = cell.min_dist;
+        cell.side[dim] = new_axis;
+        cell.min_dist = new_min;
+        self.descend(far, q, params, cell, best);
+        cell.side[dim] = old_axis;
+        cell.min_dist = saved_min;
     }
 
     /// Evaluate every point of a leaf against the current k-best set. The
@@ -268,15 +283,16 @@ struct QueryParams {
     metric: Metric,
 }
 
-
 /// Incremental cell state of the descent: the per-axis distance contribution
 /// of the current cell and its accumulated L^p lower bound.
+///
+/// Invariant between queries: `side` is all zeros — the seed for a query
+/// inside the root box. A rare out-of-box query fills it via
+/// `seed_from_root` and the caller restores the zeros with `clear` after
+/// the descent.
 struct DescentState {
     side: Vec<f64>,
     min_dist: f64,
-    /// Whether `side` may hold non-zero entries from a previous out-of-box
-    /// seed; lets `reset_zero` skip the refill when it is already clean.
-    dirty: bool,
 }
 
 impl DescentState {
@@ -284,31 +300,19 @@ impl DescentState {
         Self {
             side: vec![0.0; ndim],
             min_dist: 0.0,
-            dirty: false,
         }
     }
 
-    fn reset_zero(&mut self) {
-        if self.dirty {
-            self.side.fill(0.0);
-            self.dirty = false;
-        }
+    fn clear(&mut self) {
+        self.side.fill(0.0);
         self.min_dist = 0.0;
     }
 
     fn seed_from_root(&mut self, q: &[f64], bbox: (&[f64], &[f64]), metric: Metric) {
-        self.dirty = true;
         let (lo, hi) = bbox;
         let mut acc = 0.0_f64;
         for d in 0..q.len() {
-            let off = if q[d] < lo[d] {
-                lo[d] - q[d]
-            } else if q[d] > hi[d] {
-                q[d] - hi[d]
-            } else {
-                0.0
-            };
-            let axis = metric.axis_accum(off);
+            let axis = metric.axis_accum(box_axis_offset(q[d], lo[d], hi[d]));
             self.side[d] = axis;
             acc = metric.fold_axis(acc, axis);
         }
@@ -401,7 +405,6 @@ impl Best for BestK {
             self.nb_d[self.k - 1].min(limit)
         }
     }
-
 
     #[inline]
     fn consider(&mut self, d: f64, idx: u32) {

@@ -137,7 +137,8 @@ fn main() {
         }
     }
 
-    // single hot loop for callgrind: `profile callgrind-build` / `callgrind-query`
+    // single hot loops for callgrind: `profile callgrind-build`,
+    // `callgrind-query`, `callgrind-query-sorted`
     if mode == "callgrind-build" {
         for dims in [3, 8, 16] {
             let data = make_data("bimodal", n_points, dims);

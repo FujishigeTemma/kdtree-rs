@@ -20,15 +20,19 @@ fn kd_error(err: KDTreeError) -> PyErr {
     PyValueError::new_err(err.to_string())
 }
 
-fn as_numpy_f64<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+fn as_numpy_f64<'py>(
+    py: Python<'py>,
+    obj: &Bound<'py, PyAny>,
+) -> PyResult<PyReadonlyArrayDyn<'py, f64>> {
     // Fast path: already an f64 ndarray — skip the Python-level
-    // `numpy.asarray` round-trip entirely.
-    if obj.extract::<PyReadonlyArrayDyn<'_, f64>>().is_ok() {
-        return Ok(obj.clone());
+    // `numpy.asarray` round-trip entirely, extracting exactly once.
+    if let Ok(readonly) = obj.extract::<PyReadonlyArrayDyn<'py, f64>>() {
+        return Ok(readonly);
     }
     let numpy = py.import("numpy")?;
     let kwargs = [("dtype", numpy.getattr("float64")?)].into_py_dict(py)?;
-    numpy.call_method("asarray", (obj,), Some(&kwargs))
+    let converted = numpy.call_method("asarray", (obj,), Some(&kwargs))?;
+    Ok(converted.extract()?)
 }
 
 fn parse_queries<'py>(
@@ -36,8 +40,7 @@ fn parse_queries<'py>(
     obj: &Bound<'py, PyAny>,
     expected_ndim: usize,
 ) -> PyResult<(Vec<f64>, usize, bool)> {
-    let array = as_numpy_f64(py, obj)?;
-    let readonly = array.extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+    let readonly = as_numpy_f64(py, obj)?;
     let view = readonly.as_array();
     match view.ndim() {
         1 => {
@@ -84,8 +87,7 @@ impl KDTree {
     #[new]
     #[pyo3(signature = (data, *, leafsize = 32))]
     fn new(py: Python<'_>, data: Bound<'_, PyAny>, leafsize: usize) -> PyResult<Self> {
-        let array = as_numpy_f64(py, &data)?;
-        let readonly = array.extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+        let readonly = as_numpy_f64(py, &data)?;
         let view = readonly.as_array();
         if view.ndim() != 2 {
             return Err(kd_error(KDTreeError::InvalidShape(

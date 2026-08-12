@@ -1,8 +1,8 @@
 use std::simd::prelude::*;
 
 use crate::error::KDTreeError;
-use crate::node::{Node, ORDER_BY_BOX};
-use crate::simd::{F64s, LANES, vmax, vmin};
+use crate::node::Node;
+use crate::simd::{F64s, LANES, nonfinite_lanes, vmax, vmin};
 
 /// Subtrees at or above this many points are built on rayon worker threads;
 /// smaller ones stay on the current thread so the fork/join overhead never
@@ -46,7 +46,7 @@ impl Tree {
 
         let n_nodes = count_nodes(n_points, leafsize);
         if n_nodes > u32::MAX as usize {
-            return Err(KDTreeError::TooManyPoints(n_points));
+            return Err(KDTreeError::TooManyNodes(n_nodes));
         }
         let mut indices = (0..n_points as u32).collect::<Vec<_>>();
         let mut nodes = vec![Node::Leaf { start: 0, end: 0 }; n_nodes];
@@ -64,7 +64,6 @@ impl Tree {
             }
         }
 
-        let ctx = BuildCtx { ndim, leafsize };
         // Monomorphize the hot recursion over the row width so row swaps,
         // key extraction, and the bbox phase merge compile to straight-line
         // code for the common dimensionalities.
@@ -78,14 +77,15 @@ impl Tree {
             _ => build_range::<0>,
         };
         build(
-            &ctx,
+            ndim,
+            leafsize,
             &mut data,
             &mut indices,
             &mut nodes,
             &mut bounds,
             &mut keys,
             0,
-            0,
+            ROOT,
             true,
         );
 
@@ -141,7 +141,7 @@ impl Tree {
     }
 
     pub(crate) fn root_bbox(&self) -> (&[f64], &[f64]) {
-        self.node_bbox(0)
+        self.node_bbox(ROOT)
     }
 
     /// Return the contiguous slice of coordinates for tree positions
@@ -152,18 +152,36 @@ impl Tree {
     }
 }
 
-struct BuildCtx {
-    ndim: usize,
-    leafsize: usize,
+/// Id of the root node: the build lays nodes out in preorder starting here.
+pub(crate) const ROOT: u32 = 0;
+
+/// Both children of a flagged node must have shrunk below this fraction of
+/// the parent's extent in every non-split dimension for the node to be
+/// marked `order_by_box` (see `Node` docs). Genuinely flat data keeps
+/// non-split extents near 1.0; data on a low-dimensional manifold halves
+/// them at every split.
+const BOX_ORDER_MAX_SHRINK_RATIO: f64 = 0.6;
+
+/// Subtrees smaller than this never get the `order_by_box` flag: their
+/// extents are noisy order statistics of few samples (which false-positive
+/// on flat data), and ordering barely matters that deep anyway.
+const BOX_ORDER_MIN_SUBTREE: usize = 64;
+
+/// The split position of a node over `len` points. `count_nodes` and
+/// `build_range` both derive the preorder layout from this one policy; they
+/// must agree or the layout's slice arithmetic falls apart.
+#[inline]
+fn split_point(len: usize) -> usize {
+    len / 2
 }
 
-/// Number of nodes in the subtree over `len` points: the build always splits
-/// at `len / 2`, so the layout is fully determined by `len` alone.
+/// Number of nodes in the subtree over `len` points; fully determined by
+/// `len` alone because the split position is a function of `len`.
 fn count_nodes(len: usize, leafsize: usize) -> usize {
     if len <= leafsize {
         1
     } else {
-        let mid = len / 2;
+        let mid = split_point(len);
         1 + count_nodes(mid, leafsize) + count_nodes(len - mid, leafsize)
     }
 }
@@ -176,10 +194,11 @@ fn count_nodes(len: usize, leafsize: usize) -> usize {
 /// contiguous without a separate reorder pass. The preorder layout makes the
 /// result identical whether children are built serially or on rayon workers.
 ///
-/// `D` is the compile-time row width (`0` = use `ctx.ndim` dynamically).
+/// `D` is the compile-time row width (`0` = use `ndim` dynamically).
 #[allow(clippy::too_many_arguments)]
 fn build_range<const D: usize>(
-    ctx: &BuildCtx,
+    ndim: usize,
+    leafsize: usize,
     data: &mut [f64],
     indices: &mut [u32],
     nodes: &mut [Node],
@@ -189,14 +208,18 @@ fn build_range<const D: usize>(
     base_node: u32,
     bbox_ready: bool,
 ) {
-    let ndim = if D > 0 { D } else { ctx.ndim };
+    // The real invariant behind every `D`-specialized helper: the dispatch
+    // table in `Tree::new` must map each width to the matching instantiation.
+    debug_assert!(D == 0 || D == ndim);
+    let ndim = if D > 0 { D } else { ndim };
     let len = indices.len();
+    debug_assert_eq!(nodes.len(), count_nodes(len, leafsize));
     let (lo, hi) = bounds[..2 * ndim].split_at_mut(ndim);
     if !bbox_ready {
         compute_bbox::<D>(data, ndim, lo, hi);
     }
 
-    if len <= ctx.leafsize {
+    if len <= leafsize {
         nodes[0] = Node::Leaf {
             start: base_row as u32,
             end: (base_row + len) as u32,
@@ -205,7 +228,7 @@ fn build_range<const D: usize>(
     }
 
     let split_dim = widest_dimension(lo, hi);
-    let mid = len / 2;
+    let mid = split_point(len);
 
     // Median select runs on a contiguous copy of the split coordinates, then
     // a three-way partition moves whole rows once. This avoids the gather
@@ -217,7 +240,7 @@ fn build_range<const D: usize>(
     let pivot = *pivot;
     partition_rows::<D>(data, indices, ndim, split_dim, pivot, mid);
 
-    let left_count = count_nodes(mid, ctx.leafsize);
+    let left_count = count_nodes(mid, leafsize);
 
     let (left_data, right_data) = data.split_at_mut(mid * ndim);
     let (left_idx, right_idx) = indices.split_at_mut(mid);
@@ -231,13 +254,14 @@ fn build_range<const D: usize>(
         rayon::join(
             || {
                 build_range::<D>(
-                    ctx, left_data, left_idx, left_nodes, left_bounds, left_keys, base_row,
-                    base_node + 1, false,
+                    ndim, leafsize, left_data, left_idx, left_nodes, left_bounds, left_keys,
+                    base_row, base_node + 1, false,
                 )
             },
             || {
                 build_range::<D>(
-                    ctx,
+                    ndim,
+                    leafsize,
                     right_data,
                     right_idx,
                     right_nodes,
@@ -251,11 +275,12 @@ fn build_range<const D: usize>(
         );
     } else {
         build_range::<D>(
-            ctx, left_data, left_idx, left_nodes, left_bounds, left_keys, base_row, base_node + 1,
-            false,
+            ndim, leafsize, left_data, left_idx, left_nodes, left_bounds, left_keys, base_row,
+            base_node + 1, false,
         );
         build_range::<D>(
-            ctx,
+            ndim,
+            leafsize,
             right_data,
             right_idx,
             right_nodes,
@@ -288,18 +313,19 @@ fn build_range<const D: usize>(
             };
             max_ratio = max_ratio.max(ratio);
         }
-        max_ratio < 0.6
+        max_ratio < BOX_ORDER_MAX_SHRINK_RATIO
     };
-    // Small subtrees are skipped: their extents are noisy order statistics
-    // of few samples (which false-positive on flat data), and ordering
-    // barely matters that deep anyway.
-    let order_by_box = ndim > 1 && len >= 64 && shrunk(left_bounds) && shrunk(right_bounds);
-    *node0 = Node::Inner {
-        left: base_node + 1,
-        right: base_node + 1 + left_count as u32,
-        split_dim: split_dim as u32 | if order_by_box { ORDER_BY_BOX } else { 0 },
-        split_value: pivot,
-    };
+    let order_by_box = ndim > 1
+        && len >= BOX_ORDER_MIN_SUBTREE
+        && shrunk(left_bounds)
+        && shrunk(right_bounds);
+    *node0 = Node::inner(
+        base_node + 1,
+        base_node + 1 + left_count as u32,
+        split_dim,
+        order_by_box,
+        pivot,
+    );
 }
 
 /// Three-way (Dutch national flag) partition of whole rows around `pivot` on
@@ -397,8 +423,7 @@ fn bbox_kernel<const D: usize, const CHECK_FINITE: bool>(
     hi.fill(f64::NEG_INFINITY);
 
     let phases = ndim / gcd(ndim, LANES);
-    let zero = F64s::splat(0.0);
-    let mut nonfinite = zero.simd_ne(zero);
+    let mut nonfinite = Mask::<i64, LANES>::splat(false);
     if phases <= MAX_BBOX_PHASES {
         let mut acc_lo = [F64s::splat(f64::INFINITY); MAX_BBOX_PHASES];
         let mut acc_hi = [F64s::splat(f64::NEG_INFINITY); MAX_BBOX_PHASES];
@@ -409,7 +434,7 @@ fn bbox_kernel<const D: usize, const CHECK_FINITE: bool>(
             acc_lo[phase] = vmin(v, acc_lo[phase]);
             acc_hi[phase] = vmax(v, acc_hi[phase]);
             if CHECK_FINITE {
-                nonfinite |= (v * zero).simd_ne(zero);
+                nonfinite |= nonfinite_lanes(v);
             }
             phase += 1;
             if phase == phases {

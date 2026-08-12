@@ -6,11 +6,12 @@
 /// provide a second, stronger pruning bound that is only consulted when the
 /// cheap plane bound fails to prune.
 ///
-/// The top bit of `split_dim` (`ORDER_BY_BOX`) marks nodes whose children
-/// shrink substantially along non-split dimensions — the signature of data
+/// The top bit of `split_dim` marks nodes whose children shrink
+/// substantially along non-split dimensions — the signature of data
 /// clustered on a low-dimensional manifold, where the split plane is a poor
-/// proxy for actual proximity and the initial descent should order children
-/// by tight-box distance instead.
+/// proxy for actual proximity and queries should order and prune children
+/// by tight-box distance instead. The packing is private to this module:
+/// build with [`Node::inner`], read with [`unpack_split`].
 #[derive(Clone, Copy)]
 pub enum Node {
     Leaf {
@@ -26,4 +27,22 @@ pub enum Node {
 }
 
 /// Flag bit packed into `Node::Inner::split_dim`.
-pub const ORDER_BY_BOX: u32 = 1 << 31;
+const ORDER_BY_BOX: u32 = 1 << 31;
+
+impl Node {
+    pub fn inner(left: u32, right: u32, split_dim: usize, order_by_box: bool, split_value: f64) -> Self {
+        debug_assert!(split_dim < ORDER_BY_BOX as usize);
+        Node::Inner {
+            left,
+            right,
+            split_dim: split_dim as u32 | if order_by_box { ORDER_BY_BOX } else { 0 },
+            split_value,
+        }
+    }
+}
+
+/// Decode a packed `Node::Inner::split_dim` into `(dimension, order_by_box)`.
+#[inline(always)]
+pub fn unpack_split(split_dim: u32) -> (usize, bool) {
+    ((split_dim & !ORDER_BY_BOX) as usize, split_dim & ORDER_BY_BOX != 0)
+}

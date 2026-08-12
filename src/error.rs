@@ -10,6 +10,7 @@ pub enum KDTreeError {
     InvalidMaxDistance(f64),
     NonFiniteData,
     TooManyPoints(usize),
+    TooManyNodes(usize),
     InvalidShape(&'static str),
     DimensionMismatch { expected: usize, got: usize },
 }
@@ -33,6 +34,13 @@ impl fmt::Display for KDTreeError {
             Self::NonFiniteData => write!(f, "all coordinates must be finite"),
             Self::TooManyPoints(n) => {
                 write!(f, "n_points must fit in a 32-bit index, got {n}")
+            }
+            Self::TooManyNodes(n) => {
+                write!(
+                    f,
+                    "tree would need {n} nodes, which exceeds the 32-bit node index; \
+                     increase leafsize"
+                )
             }
             Self::InvalidShape(message) => write!(f, "{message}"),
             Self::DimensionMismatch { expected, got } => {
