@@ -16,9 +16,12 @@ Implementation = Literal["kdtree", "scipy"]
 SIZES = ((3, 10_000, 1_000), (8, 10_000, 1_000), (16, 10_000, 1_000))
 IMPLEMENTATIONS: Final = ("kdtree", "scipy")
 
+DATA_SEED: Final = 123_456_789
+QUERY_SEED: Final = 987_654_321
+
 
 def make_data(distribution: Distribution, n_points: int, dims: int) -> np.ndarray:
-    rng = np.random.default_rng(1234)
+    rng = np.random.default_rng(DATA_SEED)
     if distribution == "bimodal":
         return np.concatenate(
             (
@@ -38,20 +41,27 @@ BUILD_PARAMS = [
         dims,
         n_points,
         "bimodal",
-        id=f"build-d{dims}-n{n_points}",
+        parallel,
+        id=f"build-d{dims}-n{n_points}-{'parallel' if parallel else 'serial'}",
         marks=pytest.mark.benchmark(group=f"build-d{dims}-n{n_points}"),
     )
     for dims, n_points, _ in SIZES
+    for parallel in (False,)  # SciPy's KDTree doesn't support parallel building
 ] + [
     pytest.param(
         dims,
         n_points,
         distribution,
-        id=f"build-unbalanced-d{dims}-n{n_points}-{distribution}",
+        parallel,
+        id=(
+            f"build-unbalanced-d{dims}-n{n_points}-{distribution}"
+            f"-{'parallel' if parallel else 'serial'}"
+        ),
         marks=pytest.mark.benchmark(group=f"build-unbalanced-d{dims}-n{n_points}-{distribution}"),
     )
     for dims, n_points, _ in SIZES
     for distribution in ("uniform", "sorted")
+    for parallel in (False,)  # SciPy's KDTree doesn't support parallel building
 ]
 
 QUERY_PARAMS = [
@@ -104,7 +114,7 @@ QUERY_PARAMS = [
 
 @pytest.mark.parametrize("implementation", IMPLEMENTATIONS)
 @pytest.mark.parametrize(
-    ("dims", "n_points", "distribution"),
+    ("dims", "n_points", "distribution", "parallel"),
     BUILD_PARAMS,
 )
 def test_build(
@@ -112,11 +122,12 @@ def test_build(
     dims: int,
     n_points: int,
     distribution: Distribution,
+    parallel: bool,
     implementation: Implementation,
 ) -> None:
     data = make_data(distribution, n_points, dims)
     if implementation == "kdtree":
-        benchmark(KDTree, data, leafsize=16)
+        benchmark(KDTree, data, leafsize=16, parallel=parallel)
     else:
         benchmark(SciPyKDTree, data, leafsize=16)
 
@@ -138,7 +149,7 @@ def test_query(
     implementation: Implementation,
 ) -> None:
     data = make_data(distribution, n_points, dims)
-    queries = np.random.default_rng(1234).uniform(size=(n_queries, dims))
+    queries = np.random.default_rng(QUERY_SEED).uniform(size=(n_queries, dims))
     if implementation == "kdtree":
         tree = KDTree(data, leafsize=leafsize)
         benchmark(tree.query, queries, k=1, p=p, parallel=parallel)

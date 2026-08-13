@@ -1,0 +1,5 @@
+# std::simd (portable_simd) is not stabilized yet, so the crate builds on a
+# pinned nightly. The distance kernels contain no architecture-specific code;
+# once portable_simd stabilizes this pin can be dropped.
+[toolchain]
+channel = "nightly-2026-08-11"

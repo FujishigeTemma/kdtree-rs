@@ -32,6 +32,7 @@ dev = [
     "pytest-benchmark>=5.2.3",
     "ruff>=0.15.11",
     "scipy>=1.17.1",
+    "ty>=0.0.71",
 ]
 
 [tool.maturin]

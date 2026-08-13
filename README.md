@@ -33,3 +33,7 @@ distances, indices = tree.query(np.array([[0.2, 0.0], [2.8, 0.0]]), k=2)
 uv run pytest                     # property-based tests (vs SciPy as oracle)
 uv run pytest tests/benchmark.py  # benchmarks (vs SciPy)
 ```
+
+The distance kernels use portable SIMD (`std::simd`), which is not stabilized
+yet, so the crate builds on the nightly toolchain pinned in
+`rust-toolchain.toml` (rustup picks it up automatically).

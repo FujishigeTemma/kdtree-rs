@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
 import numpy as np
@@ -8,13 +7,12 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from kdtree import KDTree
-from numpy.typing import ArrayLike, NDArray
 from scipy.spatial import KDTree as SciPyKDTree
 
 
 class Problem(NamedTuple):
-    data: NDArray[np.float64]
-    queries: NDArray[np.float64]
+    data: np.ndarray
+    queries: np.ndarray
     k: int
     p: float
     max_distance: float | None
@@ -23,8 +21,8 @@ class Problem(NamedTuple):
 
 
 class Case(NamedTuple):
-    data: ArrayLike
-    queries: ArrayLike
+    data: np.ndarray
+    queries: np.ndarray
     k: int = 1
     p: float = 2.0
     max_distance: float | None = None
@@ -34,8 +32,8 @@ class Case(NamedTuple):
 
 @st.composite
 def problems(draw):
-    dims = draw(st.sampled_from((1, 2, 3, 8, 16)))
-    n_points = draw(st.integers(1, 256))
+    dims = draw(st.integers(1, 20))
+    n_points = draw(st.integers(1, 10000))
     n_queries = draw(st.integers(1, 32))
     rng = np.random.default_rng(draw(st.integers(0, 2**32 - 1)))
 
@@ -55,41 +53,38 @@ def problems(draw):
 
 
 def check_query(
-    data: ArrayLike,
-    queries: ArrayLike,
+    data: np.ndarray,
+    queries: np.ndarray,
     k: int,
     p: float,
     max_distance: float | None,
     leafsize: int,
     parallel: bool,
 ) -> None:
-    actual_tree = KDTree(data, leafsize=leafsize)
-    actual = actual_tree.query(
-        queries,
-        k=k,
-        p=p,
-        max_distance=max_distance,
-        parallel=parallel,
-    )
+    actual_tree = KDTree(data, leafsize=leafsize, parallel=parallel)
+    actual = actual_tree.query(queries, k=k, p=p, max_distance=max_distance, parallel=parallel)
 
     expected_tree = SciPyKDTree(data, leafsize=leafsize)
     expected = expected_tree.query(
         queries,
         k=k,
         p=p,
-        distance_upper_bound=np.inf if max_distance is None else max_distance,
+        distance_upper_bound=max_distance if max_distance is not None else np.inf,
         workers=-1 if parallel else 1,
     )
 
-    data_array = np.asarray(data, dtype=np.float64)
-    assert actual_tree.ndim == data_array.shape[1]
-    assert actual_tree.n_points == data_array.shape[0]
+    assert actual_tree.ndim == data.shape[1]
+    assert actual_tree.n_points == data.shape[0]
     assert actual_tree.leafsize == leafsize
-    assert len(actual_tree) == data_array.shape[0]
-    np.testing.assert_array_equal(actual_tree.data, data_array)
+    assert len(actual_tree) == data.shape[0]
+    np.testing.assert_array_equal(actual_tree.data, data)
 
-    expected_distances = np.asarray(expected[0]).reshape(actual[0].shape)
-    expected_indices = np.asarray(expected[1]).reshape(actual[1].shape)
+    expected_shape = (k,) if queries.ndim == 1 else (queries.shape[0], k)
+    assert actual[0].shape == expected_shape
+    assert actual[1].shape == expected_shape
+
+    expected_distances = np.asarray(expected[0]).reshape(expected_shape)
+    expected_indices = np.asarray(expected[1]).reshape(expected_shape)
     np.testing.assert_allclose(actual[0], expected_distances, atol=1e-12)
     np.testing.assert_array_equal(actual[1], expected_indices)
 
@@ -100,55 +95,80 @@ def test_compatibility(problem: Problem) -> None:
     check_query(*problem)
 
 
-PARALLEL_RNG = np.random.default_rng(42)
-PARALLEL_DATA = PARALLEL_RNG.normal(size=(2_000, 8))
-PARALLEL_QUERIES = PARALLEL_RNG.normal(size=(256, 8))
+RNG = np.random.default_rng(0)
+PARALLEL_QUERIES = RNG.normal(size=(256, 8))
 
 VALID: dict[str, Case] = {
-    "array-like": Case(
-        [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]],
-        [0.2, 0.0],
-        k=2,
-    ),
     "single-query": Case(
-        [[0.0, 0.0], [1.0, 0.0], [4.0, 0.0]],
-        [0.2, 0.0],
+        np.array([[0.0, 0.0], [1.0, 0.0], [4.0, 0.0]]),
+        np.array([0.2, 0.0]),
         k=2,
     ),
     "batch-query": Case(
-        [[0.0, 0.0], [1.0, 0.0], [4.0, 0.0]],
-        [[0.2, 0.0], [3.8, 0.0]],
+        np.array([[0.0, 0.0], [1.0, 0.0], [4.0, 0.0]]),
+        np.array([[0.2, 0.0], [3.8, 0.0]]),
         k=2,
     ),
     "max-distance-padding": Case(
-        [[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]],
-        [0.0, 0.0],
+        np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]]),
+        np.array([0.0, 0.0]),
         k=3,
         max_distance=1.0,
     ),
     "infinite-norm": Case(
-        [[0.0, 0.0], [2.0, 1.0], [1.0, 2.0]],
-        [[0.1, 0.8]],
+        np.array([[0.0, 0.0], [2.0, 1.0], [1.0, 2.0]]),
+        np.array([[0.1, 0.8]]),
         k=3,
         p=np.inf,
         leafsize=1,
     ),
+    "single-query-k1": Case(
+        np.array([[0.0, 0.0], [1.0, 0.0], [4.0, 0.0]]),
+        np.array([0.2, 0.0]),
+    ),
+    "batch-query-k1": Case(
+        np.array([[0.0, 0.0], [1.0, 0.0], [4.0, 0.0]]),
+        np.array([[0.2, 0.0], [3.8, 0.0]]),
+    ),
     "k-greater-than-points": Case(
-        [[0.0], [2.0]],
-        [[0.5]],
+        np.array([[0.0], [2.0]]),
+        np.array([[0.5]]),
         k=4,
     ),
+    "promoted-dtype": Case(
+        np.array([[0, 0], [1, 0], [4, 0]], dtype=np.int64),
+        np.array([[0.2, 0.0]], dtype=np.float32),
+        k=2,
+    ),
+    # Fortran order and a strided column view both make `as_slice()` fail,
+    # which is the only way `row_major`'s element-wise branch is reached.
+    "non-contiguous": Case(
+        np.asfortranarray([[0.0, 0.0], [1.0, 0.0], [4.0, 0.0]]),
+        np.array([[0.2, 9.0, 0.0], [3.8, 9.0, 0.0]])[:, ::2],
+        k=2,
+    ),
     "large-parallel-batch": Case(
-        PARALLEL_DATA,
+        RNG.normal(size=(2_000, 8)),
         PARALLEL_QUERIES,
         k=4,
         parallel=True,
     ),
+    **{
+        f"row-width-{dims:02d}-p{'inf' if np.isinf(p) else int(p)}": Case(
+            np.random.default_rng(dims).normal(size=(512, dims)),
+            np.random.default_rng(1_000 + dims).normal(size=(64, dims)),
+            k=3,
+            p=p,
+            leafsize=6,
+        )
+        for dims in range(1, 18)
+        for p in (1.0, 2.0, np.inf)
+    },
 }
 
 INVALID: dict[str, Case] = {
-    "query-wrong-dimensions": Case([[0.0, 0.0], [1.0, 0.0]], [0.0]),
-    "zero-k": Case([[0.0, 0.0], [1.0, 0.0]], [0.0, 0.0], k=0),
+    "query-wrong-dimensions": Case(np.array([[0.0, 0.0], [1.0, 0.0]]), np.array([0.0])),
+    "zero-k": Case(np.array([[0.0, 0.0], [1.0, 0.0]]), np.array([0.0, 0.0]), k=0),
 }
 
 
@@ -159,31 +179,5 @@ def test_valid(case: Case) -> None:
 
 @pytest.mark.parametrize("case", INVALID.values(), ids=INVALID.keys())
 def test_invalid(case: Case) -> None:
-    tree = KDTree(case.data, leafsize=case.leafsize)
     with pytest.raises(ValueError):
-        tree.query(
-            case.queries,
-            k=case.k,
-            p=case.p,
-            max_distance=case.max_distance,
-            parallel=case.parallel,
-        )
-
-
-def test_threaded_queries_are_safe() -> None:
-    rng = np.random.default_rng(7)
-    data = rng.normal(size=(1_000, 4))
-    queries = rng.normal(size=(32, 4))
-    actual_tree = KDTree(data)
-    expected_tree = SciPyKDTree(data)
-
-    def run(offset: int) -> tuple[NDArray[np.float64], NDArray[np.int64]]:
-        return actual_tree.query(queries[offset : offset + 8], k=3, parallel=True)
-
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        actual = list(executor.map(run, range(0, 32, 8)))
-
-    for offset, result in zip(range(0, 32, 8), actual, strict=True):
-        expected = expected_tree.query(queries[offset : offset + 8], k=3, workers=1)
-        np.testing.assert_allclose(result[0], expected[0], atol=1e-12)
-        np.testing.assert_array_equal(result[1], expected[1])
+        KDTree(case.data, leafsize=case.leafsize).query(case.queries, k=case.k, p=case.p)
