@@ -1,25 +1,9 @@
-//! A minimal, high-performance immutable KDTree for k-nearest-neighbor
-//! queries, exposed to free-threaded CPython as `kdtree._core`.
-//!
-//! # Module map
-//!
-//! The crate is layered so each module owns exactly one concern:
-//!
-//! - `metric.rs` — the `L^p` algebra over *reduced distances*, the domain
-//!   every distance in the crate is carried in.
-//! - `simd.rs` — architecture-neutral SIMD primitives (lane width, lane-wise
-//!   min/max, horizontal reductions).
-//! - `kernel.rs` — every bulk loop over point rows: bounding boxes for the
-//!   build, and the reduced-distance kernels for queries.
-//! - `tree.rs` — the storage layout (`Tree`, `Node`) and read access.
-//! - `build.rs` — the only writer of that layout.
-//! - `query.rs` — the branch-and-bound descent and the k-best set.
-//! - this file — the Python boundary: argument coercion in, ndarray out.
 #![feature(portable_simd)]
 
 mod build;
 pub mod error;
 mod kernel;
+mod layout;
 mod metric;
 mod query;
 mod simd;
@@ -38,14 +22,7 @@ fn kd_error(err: KDTreeError) -> PyErr {
     PyValueError::new_err(err.to_string())
 }
 
-/// View an ndarray as `f64`, promoting other dtypes.
-///
-/// The API takes `numpy.ndarray` and nothing else, so this never has to build
-/// an array out of a sequence: the non-`f64` case is one `astype` on an array
-/// that already exists, and anything that is not an array is a `TypeError`
-/// rather than a silent (and, for a ragged list, surprising) conversion.
 fn as_f64_array<'py>(obj: &Bound<'py, PyAny>) -> PyResult<PyReadonlyArrayDyn<'py, f64>> {
-    // Fast path: already f64, so extract exactly once and copy nothing.
     if let Ok(readonly) = obj.extract::<PyReadonlyArrayDyn<'py, f64>>() {
         return Ok(readonly);
     }
@@ -60,8 +37,6 @@ fn as_f64_array<'py>(obj: &Bound<'py, PyAny>) -> PyResult<PyReadonlyArrayDyn<'py
     Ok(array.call_method1("astype", ("float64",))?.extract()?)
 }
 
-/// Copy a view into one row-major `Vec` — the layout the core expects — with
-/// a straight memcpy whenever the input is already contiguous.
 fn row_major(view: &ArrayViewD<'_, f64>) -> Vec<f64> {
     match view.as_slice() {
         Some(slice) => slice.to_vec(),
@@ -69,18 +44,14 @@ fn row_major(view: &ArrayViewD<'_, f64>) -> Vec<f64> {
     }
 }
 
-/// A `(n_rows, ndim)` point matrix normalized out of Python. `single` records
-/// that the caller passed one bare point, so `query` can mirror that shape
-/// back in its result.
 struct Points {
     values: Vec<f64>,
     n_rows: usize,
     ndim: usize,
+    /// The caller passed one bare point, so `query` mirrors that shape back.
     single: bool,
 }
 
-/// Normalize an argument of `what` into a point matrix, accepting a single
-/// `(ndim,)` point only when `allow_single`.
 fn as_points(obj: &Bound<'_, PyAny>, what: &'static str, allow_single: bool) -> PyResult<Points> {
     let readonly = as_f64_array(obj)?;
     let view = readonly.as_array();
@@ -103,7 +74,6 @@ fn as_points(obj: &Bound<'_, PyAny>, what: &'static str, allow_single: bool) -> 
 }
 
 impl Points {
-    /// Require rows of exactly `ndim` coordinates.
     fn require_ndim(self, ndim: usize) -> PyResult<Self> {
         if self.ndim != ndim {
             return Err(kd_error(KDTreeError::DimensionMismatch {
@@ -115,8 +85,6 @@ impl Points {
     }
 }
 
-/// Box one result buffer as a numpy array of `shape`, or as a bare 1-D
-/// vector when `shape` is `None` (the single-point query result).
 fn to_numpy<T: Element>(
     py: Python<'_>,
     values: Vec<T>,
@@ -147,8 +115,7 @@ impl KDTree {
         parallel: bool,
     ) -> PyResult<Self> {
         let points = as_points(&data, "data must be a two-dimensional array", false)?;
-        // The borrow of the caller's array ended with `as_points`, so the
-        // build below owns its data and can run detached from the GIL.
+        // The copy in `as_points` is what lets the build run detached from the GIL.
         let tree = py
             .detach(|| Tree::new(points.values, points.ndim, leafsize, parallel))
             .map_err(kd_error)?;
@@ -212,8 +179,6 @@ impl KDTree {
             .detach(|| tree.query(&queries.values, k, p, max_distance, eps, parallel))
             .map_err(kd_error)?;
 
-        // A single-point query answers with bare `(k,)` vectors; a batch
-        // answers with `(n_queries, k)` matrices.
         let shape = (!queries.single).then_some((queries.n_rows, k));
         Ok((to_numpy(py, distances, shape), to_numpy(py, indices, shape)))
     }

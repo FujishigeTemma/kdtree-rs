@@ -1,31 +1,30 @@
-//! k-nearest-neighbor queries: validation, the branch-and-bound descent,
-//! and the running k-best set. Every distance-valued `f64` in this module
-//! is a *reduced distance* (see `metric.rs`); only `Best::write_results`
-//! restores true distances, once per emitted result.
+//! The descent prunes with two bounds, checked in order of cost: an
+//! O(1)-updatable lower bound on the distance from the query to the current cell
+//! (per-axis parts in [`CellBound`], the folded total passed down the
+//! recursion), and — only when that fails to prune — the tight box of the points
+//! the subtree actually contains. The tight box is what collapses degenerate
+//! clustered data, where every split lands on the same few dimensions and plane
+//! bounds stay uselessly small; the plane bound keeps the common well-separated
+//! descent free of O(ndim) box work.
 //!
-//! # Pruning
-//!
-//! The descent maintains an O(1)-updatable lower bound on the reduced
-//! distance from the query to the current cell (per-axis parts in
-//! [`Scratch::cell`], the folded total passed down the recursion). Before
-//! entering a far child two bounds are checked in order of cost: that
-//! incremental split-plane bound, then — only if it fails to prune — the
-//! tight bounding box of the points the far subtree actually contains. The
-//! tight box is what collapses degenerate clustered data (where every split
-//! lands on the same few dimensions and plane bounds stay uselessly small);
-//! the plane bound keeps the common well-separated descent free of O(ndim)
-//! box work.
+//! **Box distances gate visits and nothing else.** A child is always entered
+//! with a bound derived from [`CellBound`], never with its own box distance.
+//! Feed a box distance into the recursion and it drifts out of step with the
+//! per-axis breakdown, so every later `replace_axis` subtracts a contribution
+//! that is not in the total — silently wrong results, not a crash.
+
+use std::marker::PhantomData;
 
 use rayon::prelude::*;
 
 use crate::error::KDTreeError;
-use crate::kernel;
-use crate::metric::{Metric, box_axis_offset};
+use crate::kernel::{self, Packed, Streamed, Strategy};
+use crate::layout::{BBox, axis_offset};
+use crate::metric::{Metric, Rd};
 use crate::tree::{Node, ROOT, Tree};
 
-/// Minimum queries per rayon task. Each query can be well under a
-/// microsecond, so without a floor the per-task overhead of a
-/// one-query-per-item split swamps the work being distributed.
+/// A query can be well under a microsecond, so without a floor rayon's per-task
+/// overhead swamps the work being distributed.
 const PARALLEL_QUERY_MIN_CHUNK: usize = 16;
 
 impl Tree {
@@ -68,34 +67,34 @@ impl Tree {
         let mut distances = vec![0.0_f64; n_queries * k];
         let mut indices = vec![0_i64; n_queries * k];
 
-        // Monomorphizing over the metric as well was measured slower here
-        // (the const-folded kernels inline into `descend` and bloat it);
-        // the enum dispatch stays perfectly predicted instead.
-        if k == 1 {
-            self.run_queries::<Best1>(queries, k, params, parallel, &mut distances, &mut indices);
-        } else {
-            self.run_queries::<BestK>(queries, k, params, parallel, &mut distances, &mut indices);
+        // Monomorphizing over the metric as well was measured slower: the
+        // const-folded kernels inline into `descend` and bloat it, where the
+        // enum dispatch stays perfectly predicted.
+        let args = (queries, k, params, parallel);
+        match (k == 1, kernel::packs(metric, self.ndim())) {
+            (true, true) => self.run::<Best1, Packed>(args, &mut distances, &mut indices),
+            (true, false) => self.run::<Best1, Streamed>(args, &mut distances, &mut indices),
+            (false, true) => self.run::<BestK, Packed>(args, &mut distances, &mut indices),
+            (false, false) => self.run::<BestK, Streamed>(args, &mut distances, &mut indices),
         }
 
         Ok((distances, indices))
     }
 
-    fn run_queries<B: Best>(
+    fn run<B: Best, K: Strategy>(
         &self,
-        queries: &[f64],
-        k: usize,
-        params: QueryParams,
-        parallel: bool,
+        (queries, k, params, parallel): (&[f64], usize, QueryParams, bool),
         distances: &mut [f64],
         indices: &mut [i64],
     ) {
         let ndim = self.ndim();
         let n_queries = queries.len() / ndim;
         let run = |scratch: &mut Scratch<B>, i: usize, out_d: &mut [f64], out_i: &mut [i64]| {
-            let descent = Descent {
+            let descent = Descent::<K> {
                 tree: self,
                 params,
                 q: &queries[i * ndim..(i + 1) * ndim],
+                strategy: PhantomData,
             };
             descent.run(scratch, out_d, out_i);
         };
@@ -121,51 +120,108 @@ impl Tree {
     }
 }
 
-/// Immutable parameters shared by every query of one `query` call.
-/// `cutoff` is `max_distance` in the reduced domain.
 #[derive(Clone, Copy)]
 struct QueryParams {
-    cutoff: f64,
+    /// `max_distance`, reduced.
+    cutoff: Rd,
     eps_factor: f64,
     metric: Metric,
 }
 
-/// One thread's reusable mutable state, allocated once and reused across
-/// queries. Kept separate from [`Descent`] so the recursion borrows its
-/// read-only context and its mutable state independently — handing the hot
-/// path one `&mut` over everything forces the compiler to reload the
-/// context after every recursive call.
+/// Allocated once per thread and reused across queries. Kept separate from
+/// [`Descent`] so the recursion borrows read-only context and mutable state
+/// independently — one `&mut` over both forces a context reload after every
+/// recursive call.
 struct Scratch<B> {
-    /// Per-axis reduced contribution of the current cell's lower bound.
-    ///
-    /// Invariant between queries: all zeros — the correct seed for a query
-    /// inside the root box, which is the overwhelmingly common case. A rare
-    /// out-of-box query fills it via `Descent::seed_cell` and restores the
-    /// zeros after its descent.
-    cell: Vec<f64>,
+    cell: CellBound,
     best: B,
 }
 
 impl<B: Best> Scratch<B> {
     fn new(ndim: usize, k: usize) -> Self {
         Self {
-            cell: vec![0.0; ndim],
+            cell: CellBound::new(ndim),
             best: B::new(k),
         }
     }
 }
 
-/// The immutable context of one query's descent: the tree, the search
-/// parameters, and the query point.
-#[derive(Clone, Copy)]
-struct Descent<'a> {
+/// The split-plane lower bound, kept as its per-axis contributions — the
+/// breakdown that makes `replace_axis` an O(1) update. The folded total is not
+/// here: it is per-frame and travels as a recursion argument, since shared
+/// mutable state would force a reload after every recursive call.
+///
+/// Invariant: all axes are zero between queries. That is already the answer for
+/// a query inside the root box, which is the overwhelmingly common case, so
+/// [`CellBound::start`] normally writes nothing and [`CellBound::finish`] has
+/// nothing to undo.
+struct CellBound {
+    axes: Vec<Rd>,
+    seeded: bool,
+}
+
+impl CellBound {
+    fn new(ndim: usize) -> Self {
+        Self {
+            axes: vec![Rd::ZERO; ndim],
+            seeded: false,
+        }
+    }
+
+    /// One vectorized box distance decides the common case, and that decision is
+    /// what inlines into the caller; the rare fill stays out of line.
+    #[inline(always)]
+    fn start(&mut self, m: Metric, q: &[f64], root: BBox<'_>) -> Rd {
+        if kernel::box_rd(m, q, root) == Rd::ZERO {
+            return Rd::ZERO;
+        }
+        self.seed(m, q, root)
+    }
+
+    fn seed(&mut self, m: Metric, q: &[f64], root: BBox<'_>) -> Rd {
+        let mut rd = Rd::ZERO;
+        let bounds = q.iter().zip(root.lo).zip(root.hi);
+        for (slot, ((&q, &lo), &hi)) in self.axes.iter_mut().zip(bounds) {
+            let axis = m.reduce(axis_offset(q, lo, hi));
+            *slot = axis;
+            rd = m.fold(rd, axis);
+        }
+        self.seeded = true;
+        rd
+    }
+
+    fn finish(&mut self) {
+        if self.seeded {
+            self.axes.fill(Rd::ZERO);
+            self.seeded = false;
+        }
+    }
+
+    #[inline(always)]
+    fn axis(&self, dim: usize) -> Rd {
+        self.axes[dim]
+    }
+
+    #[inline(always)]
+    #[must_use = "the previous axis contribution has to be restored by `leave`"]
+    fn enter(&mut self, dim: usize, axis: Rd) -> Rd {
+        std::mem::replace(&mut self.axes[dim], axis)
+    }
+
+    #[inline(always)]
+    fn leave(&mut self, dim: usize, saved: Rd) {
+        self.axes[dim] = saved;
+    }
+}
+
+struct Descent<'a, K: Strategy> {
     tree: &'a Tree,
     params: QueryParams,
     q: &'a [f64],
+    strategy: PhantomData<K>,
 }
 
-impl<'a> Descent<'a> {
-    /// Answer this query, writing `k` results to `out_d`/`out_i`.
+impl<K: Strategy> Descent<'_, K> {
     fn run<B: Best>(&self, s: &mut Scratch<B>, out_d: &mut [f64], out_i: &mut [i64]) {
         let QueryParams {
             cutoff,
@@ -173,44 +229,25 @@ impl<'a> Descent<'a> {
             metric,
         } = self.params;
         s.best.reset();
-        let (lo, hi) = self.tree.root_box();
-        if kernel::box_rd(metric, self.q, lo, hi) == 0.0 {
-            self.descend(ROOT, 0.0, s);
-        } else {
-            let seed = self.seed_cell(lo, hi, &mut s.cell);
-            if seed * eps_factor <= cutoff {
-                self.descend(ROOT, seed, s);
-            }
-            s.cell.fill(0.0);
+        let seed = s.cell.start(metric, self.q, self.tree.root_box());
+        if seed.scaled(eps_factor) <= cutoff {
+            self.descend(ROOT, seed, s);
         }
+        s.cell.finish();
         s.best
             .write_results(out_d, out_i, self.tree.n_points(), metric);
     }
 
-    /// Fill `cell` for a query outside the root box and return the folded
-    /// cell bound.
-    fn seed_cell(&self, lo: &[f64], hi: &[f64], cell: &mut [f64]) -> f64 {
-        let metric = self.params.metric;
-        let mut rd = 0.0_f64;
-        for d in 0..self.q.len() {
-            let axis = metric.axis_rd(box_axis_offset(self.q[d], lo[d], hi[d]));
-            cell[d] = axis;
-            rd = metric.fold(rd, axis);
-        }
-        rd
-    }
-
-    /// Is a subtree whose lower bound is `rd` still worth entering? The
-    /// approximation factor scales the lower bound rather than the k-best
-    /// bound so the comparison stays in the reduced domain.
+    /// The approximation factor scales the lower bound rather than the k-best
+    /// bound, so the comparison stays in the reduced domain.
     #[inline(always)]
-    fn admits<B: Best>(&self, rd: f64, s: &Scratch<B>) -> bool {
-        rd * self.params.eps_factor <= s.best.bound(self.params.cutoff)
+    fn admits<B: Best>(&self, rd: Rd, s: &Scratch<B>) -> bool {
+        rd.scaled(self.params.eps_factor) <= s.best.bound(self.params.cutoff)
     }
 
-    /// Recursive branch-and-bound descent into `node_id`, whose cell has the
-    /// lower bound `cell_rd` (per-axis parts in `s.cell`).
-    fn descend<B: Best>(&self, node_id: u32, cell_rd: f64, s: &mut Scratch<B>) {
+    /// `cell_rd` is the lower bound of `node_id`'s cell; its per-axis parts are
+    /// in `s.cell`.
+    fn descend<B: Best>(&self, node_id: u32, cell_rd: Rd, s: &mut Scratch<B>) {
         let QueryParams {
             cutoff,
             eps_factor,
@@ -236,8 +273,8 @@ impl<'a> Descent<'a> {
                     (right, left)
                 };
 
-                let far_axis = metric.axis_rd(diff.abs());
-                let far_rd = metric.replace_axis(cell_rd, s.cell[dim], far_axis);
+                let far_axis = metric.reduce(diff.abs());
+                let far_rd = metric.replace_axis(cell_rd, s.cell.axis(dim), far_axis);
 
                 if order_by_box {
                     self.descend_by_box(near, far, dim, cell_rd, far_axis, far_rd, s);
@@ -247,9 +284,9 @@ impl<'a> Descent<'a> {
                 self.descend(near, cell_rd, s);
 
                 let bound = s.best.bound(cutoff);
-                if far_rd * eps_factor <= bound {
-                    let (far_lo, far_hi) = self.tree.box_of(far);
-                    if kernel::box_rd(metric, self.q, far_lo, far_hi) * eps_factor <= bound {
+                if far_rd.scaled(eps_factor) <= bound {
+                    let far_box = self.tree.box_of(far);
+                    if kernel::box_rd(metric, self.q, far_box).scaled(eps_factor) <= bound {
                         self.enter_far(far, dim, far_axis, far_rd, s);
                     }
                 }
@@ -257,11 +294,12 @@ impl<'a> Descent<'a> {
         }
     }
 
-    /// Visit both children of a manifold-clustered node (see [`Node`] docs):
-    /// the split plane misjudges both proximity and pruning there, so the
-    /// visit is ordered and both children gated by tight box distance.
-    /// Kept out of line so the flag test stays cheap in `descend`'s hot
-    /// path — flat data never sets the flag and pays nothing beyond it.
+    /// Visiting one child tightens the bound for the other, so both box gates are
+    /// tested as we go. Each child still descends on its plane bound (`cell_rd` /
+    /// `far_rd`) — see the module invariant.
+    ///
+    /// Out of line so that flat data, which never sets the flag, pays only the
+    /// flag test.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn descend_by_box<B: Best>(
@@ -269,22 +307,15 @@ impl<'a> Descent<'a> {
         near: u32,
         far: u32,
         dim: usize,
-        cell_rd: f64,
-        far_axis: f64,
-        far_rd: f64,
+        cell_rd: Rd,
+        far_axis: Rd,
+        far_rd: Rd,
         s: &mut Scratch<B>,
     ) {
         let metric = self.params.metric;
-        let (n_lo, n_hi) = self.tree.box_of(near);
-        let near_box = kernel::box_rd(metric, self.q, n_lo, n_hi);
-        let (f_lo, f_hi) = self.tree.box_of(far);
-        let far_box = kernel::box_rd(metric, self.q, f_lo, f_hi);
+        let near_box = kernel::box_rd(metric, self.q, self.tree.box_of(near));
+        let far_box = kernel::box_rd(metric, self.q, self.tree.box_of(far));
 
-        // The near child keeps the parent's incremental cell bound: box
-        // distances gate the visits but never leak into the plane-bound
-        // algebra, which stays consistent with `cell`. Both gates are
-        // re-tested as we go, since visiting one child tightens the bound
-        // for the other.
         if near_box <= far_box {
             if self.admits(near_box, s) {
                 self.descend(near, cell_rd, s);
@@ -302,83 +333,84 @@ impl<'a> Descent<'a> {
         }
     }
 
-    /// Enter the plane-far child: apply the far side's axis contribution to
-    /// `cell`, descend with the updated bound, and restore. The one place
-    /// that owns the save/restore protocol of `cell`.
     #[inline(always)]
-    fn enter_far<B: Best>(
-        &self,
-        far: u32,
-        dim: usize,
-        far_axis: f64,
-        far_rd: f64,
-        s: &mut Scratch<B>,
-    ) {
-        let saved_axis = s.cell[dim];
-        s.cell[dim] = far_axis;
+    fn enter_far<B: Best>(&self, far: u32, dim: usize, far_axis: Rd, far_rd: Rd, s: &mut Scratch<B>) {
+        let saved = s.cell.enter(dim, far_axis);
         self.descend(far, far_rd, s);
-        s.cell[dim] = saved_axis;
+        s.cell.leave(dim, saved);
     }
 
-    /// Evaluate every point of a leaf against the current k-best set. The
-    /// scan kernel owns the strategy (SIMD block kernels for short rows,
-    /// early-exit per-point scan otherwise); this only supplies the bound
-    /// and folds hits into the k-best buffer.
     #[inline]
     fn scan_leaf<B: Best>(&self, start: usize, end: usize, s: &mut Scratch<B>) {
         let QueryParams { cutoff, metric, .. } = self.params;
-        let block = self.tree.rows(start, end);
-        let originals = &self.tree.indices;
-        let best = &mut s.best;
-        let bound = best.bound(cutoff);
-        kernel::scan_leaf(metric, self.q, block, bound, |offset, rd| {
-            best.consider(rd, originals[start + offset]);
-            best.bound(cutoff)
-        });
+        let mut sink = LeafSink {
+            best: &mut s.best,
+            originals: &self.tree.indices,
+            start,
+            cutoff,
+        };
+        K::scan(metric, self.q, self.tree.rows(start, end), &mut sink);
     }
 }
 
-/// Running k-best set of one query. Monomorphizing the descent over this
-/// keeps the ubiquitous `k == 1` case in two registers instead of heap
-/// buffers.
+/// Leaf-relative offsets in, original row indices out.
+struct LeafSink<'a, B> {
+    best: &'a mut B,
+    originals: &'a [u32],
+    start: usize,
+    cutoff: Rd,
+}
+
+impl<B: Best> kernel::Sink for LeafSink<'_, B> {
+    #[inline(always)]
+    fn bound(&self) -> Rd {
+        self.best.bound(self.cutoff)
+    }
+
+    #[inline(always)]
+    fn offer(&mut self, offset: usize, rd: Rd) {
+        self.best.consider(rd, self.originals[self.start + offset]);
+    }
+}
+
+/// The descent is monomorphized over this so the ubiquitous `k == 1` case lives
+/// in two registers instead of heap buffers.
 trait Best {
     fn new(k: usize) -> Self;
     fn reset(&mut self);
-    /// Current pruning bound: the k-th best reduced distance so far, capped
-    /// at `cutoff`.
-    fn bound(&self, cutoff: f64) -> f64;
-    /// Offer `(rd, idx)`. Ties resolve toward the smaller original index,
-    /// matching `numpy.argsort(kind="stable")`.
-    fn consider(&mut self, rd: f64, idx: u32);
+    /// The k-th best reduced distance so far, capped at `cutoff`.
+    fn bound(&self, cutoff: Rd) -> Rd;
+    /// Ties must resolve toward the smaller original index: SciPy is the oracle
+    /// in `tests/test_kdtree.py`, and indices are compared exactly.
+    fn consider(&mut self, rd: Rd, idx: u32);
     fn write_results(&self, out_d: &mut [f64], out_i: &mut [i64], n_points: usize, m: Metric);
 }
 
-/// Single nearest neighbor.
 struct Best1 {
-    rd: f64,
+    rd: Rd,
     i: u32,
 }
 
 impl Best for Best1 {
     fn new(_k: usize) -> Self {
         Self {
-            rd: f64::INFINITY,
+            rd: Rd::INFINITY,
             i: u32::MAX,
         }
     }
 
     fn reset(&mut self) {
-        self.rd = f64::INFINITY;
+        self.rd = Rd::INFINITY;
         self.i = u32::MAX;
     }
 
     #[inline]
-    fn bound(&self, cutoff: f64) -> f64 {
+    fn bound(&self, cutoff: Rd) -> Rd {
         self.rd.min(cutoff)
     }
 
     #[inline]
-    fn consider(&mut self, rd: f64, idx: u32) {
+    fn consider(&mut self, rd: Rd, idx: u32) {
         if rd < self.rd || (rd == self.rd && idx < self.i) {
             self.rd = rd;
             self.i = idx;
@@ -396,10 +428,10 @@ impl Best for Best1 {
     }
 }
 
-/// General `k`: a small sorted buffer, insertion-sorted on the fly.
+/// A sorted buffer, insertion-sorted on the fly.
 struct BestK {
     k: usize,
-    rds: Vec<f64>,
+    rds: Vec<Rd>,
     ids: Vec<u32>,
 }
 
@@ -418,7 +450,7 @@ impl Best for BestK {
     }
 
     #[inline]
-    fn bound(&self, cutoff: f64) -> f64 {
+    fn bound(&self, cutoff: Rd) -> Rd {
         if self.rds.len() < self.k {
             cutoff
         } else {
@@ -427,7 +459,7 @@ impl Best for BestK {
     }
 
     #[inline]
-    fn consider(&mut self, rd: f64, idx: u32) {
+    fn consider(&mut self, rd: Rd, idx: u32) {
         if self.rds.len() == self.k {
             let worst_rd = self.rds[self.k - 1];
             if rd > worst_rd || (rd == worst_rd && self.ids[self.k - 1] <= idx) {
@@ -458,53 +490,5 @@ impl Best for BestK {
                 out_i[j] = n_points as i64;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use approx::assert_relative_eq;
-
-    use crate::tree::Tree;
-
-    #[test]
-    fn query_returns_exact_nearest_neighbors() {
-        let data = vec![0.0, 0.0, 2.0, 0.0, 4.0, 0.0, 5.0, 0.0];
-        let tree = Tree::new(data, 2, 2, true).expect("tree should build");
-
-        let (distances, indices) = tree
-            .query(&[1.5, 0.0], 2, 2.0, None, 0.0, false)
-            .expect("query should succeed");
-
-        assert_eq!(indices, vec![1, 0]);
-        assert_relative_eq!(distances[0], 0.5);
-        assert_relative_eq!(distances[1], 1.5);
-    }
-
-    #[test]
-    fn query_pads_missing_neighbors() {
-        let data = vec![0.0, 0.0, 10.0, 0.0];
-        let tree = Tree::new(data, 2, 1, true).expect("tree should build");
-
-        let (distances, indices) = tree
-            .query(&[0.0, 0.0, 11.0, 0.0], 3, 2.0, Some(2.0), 0.0, false)
-            .expect("query should succeed");
-
-        assert_eq!(indices.len(), 6);
-        assert_eq!(indices[2], 2);
-        assert!(distances[2].is_infinite());
-        assert_eq!(indices[5], 2);
-        assert!(distances[5].is_infinite());
-    }
-
-    #[test]
-    fn single_best_query_matches_k1() {
-        let data = vec![0.0, 0.0, 1.0, 1.0, -2.0, 0.5, 3.0, -1.0];
-        let tree = Tree::new(data, 2, 1, true).expect("tree should build");
-        let (d, i) = tree
-            .query(&[0.9, 0.9], 1, 2.0, None, 0.0, false)
-            .expect("query should succeed");
-        assert_eq!(i, vec![1]);
-        assert_relative_eq!(d[0], (0.02_f64).sqrt());
     }
 }

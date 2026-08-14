@@ -1,38 +1,28 @@
-//! Vectorized bulk kernels: every loop that streams whole blocks of point
-//! rows lives here. The build uses [`bbox`]/[`bbox_check_finite`] to bound
-//! row blocks; queries use the reduced-distance kernels [`point_rd`],
-//! [`scan_leaf`], and [`box_rd`] (all values in the domain of `metric.rs`).
+//! Two rules hold across every distance kernel here:
 //!
-//! The distance kernels share two ideas:
-//! - reduced distances accumulate monotonically for every supported metric,
-//!   so a partial value that already exceeds the caller's bound is a valid
-//!   early-exit result;
-//! - bound checks happen once per SIMD chunk, not per axis — a horizontal
-//!   reduction every axis would serialize the kernel, while a full-row scan
-//!   would give up the early exit that saves most of the work in high
-//!   dimensions.
+//! - reduced distances accumulate monotonically for every supported metric, so
+//!   a partial value already past the caller's bound is a valid answer;
+//! - bound checks happen once per SIMD chunk. Per axis, the horizontal
+//!   reduction serializes the kernel; per row, the early exit that saves most
+//!   of the work in high dimensions is gone.
 //!
-//! # `L^p` routing
+//! `powf` has no SIMD lowering, so a general `L^p` never reaches a vector
+//! kernel: `point_rd` and `box_rd` divert `Metric::LP` up front and [`packs`]
+//! routes it to [`Streamed`]. That is what makes the `LP` arms of `axes_lanes`
+//! and `fold_scalar` unreachable.
 //!
-//! `powf` has no SIMD lowering, so a general `L^p` never enters a vector
-//! kernel: each public entry point (`point_rd`, `scan_leaf`, `box_rd`)
-//! diverts `Metric::LP` to its own scalar path up front, and the three
-//! vector primitives below (`axes_lanes`, `combine`, `fold_scalar`) are
-//! unreachable for it — hence their `unreachable!` arms.
-//!
-//! Narrowing those primitives to a three-variant enum removes the
-//! `unreachable!`s and reads better, but measured 10-25% slower on
-//! high-dimensional leaf scans (d8/d16 with `leafsize = 128`), so `Metric`
-//! stays the parameter type. Only the effect was measured, not the cause;
-//! if you retry this, A/B it rather than trusting that it is free.
+//! Narrowing the vector primitives to a three-variant enum removes those
+//! `unreachable!`s and reads better, but measured 10-25% slower on d8/d16 leaf
+//! scans with `leafsize = 128`. Only the effect was measured, not the cause —
+//! A/B it rather than assuming it is free.
 
 use std::simd::prelude::*;
 use std::simd::simd_swizzle;
 
-use crate::metric::{Metric, box_axis_offset};
+use crate::layout::{BBox, BBoxMut, Rows, Width, axis_offset};
+use crate::metric::{Metric, Rd};
 use crate::simd::{F64s, LANES, hmax, hsum, nonfinite_lanes, vmax, vmin};
 
-/// Reduced contribution of a lane-wise axis difference.
 #[inline(always)]
 fn axes_lanes(m: Metric, delta: F64s) -> F64s {
     match m {
@@ -42,8 +32,6 @@ fn axes_lanes(m: Metric, delta: F64s) -> F64s {
     }
 }
 
-/// Combine two vectors of partial reduced distances lane-wise: max for
-/// `L^inf`, sum for every other metric.
 #[inline(always)]
 fn combine<const N: usize>(m: Metric, a: Simd<f64, N>, b: Simd<f64, N>) -> Simd<f64, N> {
     match m {
@@ -52,8 +40,8 @@ fn combine<const N: usize>(m: Metric, a: Simd<f64, N>, b: Simd<f64, N>) -> Simd<
     }
 }
 
-/// Scalar fold over any run of axes. The match stays outside the loop so
-/// each arm keeps a tight body LLVM can unroll or vectorize.
+/// The match stays outside the loop so each arm keeps a body tight enough for
+/// LLVM to unroll or vectorize.
 #[inline(always)]
 fn fold_scalar(m: Metric, mut rd: f64, lhs: &[f64], rhs: &[f64]) -> f64 {
     match m {
@@ -81,11 +69,8 @@ fn fold_scalar(m: Metric, mut rd: f64, lhs: &[f64], rhs: &[f64]) -> f64 {
     rd
 }
 
-// --- finiteness --------------------------------------------------------------
-
-/// Vectorized finiteness sweep over a whole slice. The build gets the same
-/// check for free inside [`bbox_check_finite`]; queries, which compute no
-/// box, use this standalone pass.
+/// The build gets this check for free inside [`Rows::bbox_checked_into`];
+/// queries, which compute no box, need the standalone pass.
 pub(crate) fn all_finite(values: &[f64]) -> bool {
     let mut nonfinite = Mask::<i64, LANES>::splat(false);
     let (chunks, rest) = values.as_chunks::<LANES>();
@@ -95,100 +80,86 @@ pub(crate) fn all_finite(values: &[f64]) -> bool {
     !nonfinite.any() && rest.iter().all(|v| v.is_finite())
 }
 
-// --- bounding boxes of row blocks ------------------------------------------
-
-/// Maximum number of phase accumulators for the flat bbox kernel: covers
-/// every row width whose pattern period `ndim / gcd(ndim, LANES)` is at most
-/// this many vectors (all of 1..=8, plus common wider even widths).
+/// Covers every row width whose phase period is at most this many vectors: all
+/// of 1..=8, plus common wider even widths.
 const MAX_PHASES: usize = 8;
 
-/// Tight bounding box of the row-major block `data`, written to `lo`/`hi`
-/// (each `ndim` long).
-///
-/// Instead of chunking each row (useless for rows shorter than a vector),
-/// the kernel streams the block as flat `LANES`-wide vectors. Lane `j` of
-/// flat vector `i` holds dimension `(i * LANES + j) % ndim`, a pattern that
-/// repeats every `ndim / gcd(ndim, LANES)` vectors, so that many phase
-/// accumulators cover every dimension; a final scalar merge scatters the
-/// accumulator lanes back to their dimensions. Row widths with too long a
-/// period fall back to a scalar row sweep.
-///
-/// `D` is the compile-time row width (`0` = dynamic): with it fixed, the
-/// phase count is a constant and the whole phase/merge machinery unrolls.
-pub(crate) fn bbox<const D: usize>(data: &[f64], ndim: usize, lo: &mut [f64], hi: &mut [f64]) {
-    bbox_kernel::<D, false>(data, ndim, lo, hi);
-}
+impl<W: Width> Rows<'_, W> {
+    pub(crate) fn bbox_into(self, out: &mut BBoxMut<'_>) {
+        self.bbox_kernel::<false>(out);
+    }
 
-/// [`bbox`], plus a fused finiteness check over every element (the
-/// `v * 0 != 0` trick catches both infinities and NaNs without extra
-/// passes). Returns `false` when any element is non-finite.
-pub(crate) fn bbox_check_finite(data: &[f64], ndim: usize, lo: &mut [f64], hi: &mut [f64]) -> bool {
-    bbox_kernel::<0, true>(data, ndim, lo, hi)
-}
+    /// [`Rows::bbox_into`] with the finiteness check fused in; `false` when any
+    /// element is non-finite.
+    pub(crate) fn bbox_checked_into(self, out: &mut BBoxMut<'_>) -> bool {
+        self.bbox_kernel::<true>(out)
+    }
 
-fn bbox_kernel<const D: usize, const CHECK_FINITE: bool>(
-    data: &[f64],
-    ndim: usize,
-    lo: &mut [f64],
-    hi: &mut [f64],
-) -> bool {
-    debug_assert!(D == 0 || D == ndim);
-    let ndim = if D > 0 { D } else { ndim };
-    let lo = &mut lo[..ndim];
-    let hi = &mut hi[..ndim];
-    lo.fill(f64::INFINITY);
-    hi.fill(f64::NEG_INFINITY);
+    /// Chunking each row is useless for rows shorter than a vector, so the block
+    /// streams as flat `LANES`-wide vectors instead. Lane `j` of flat vector `i`
+    /// then holds dimension `(i * LANES + j) % ndim`, a pattern that repeats
+    /// every `ndim / gcd(ndim, LANES)` vectors — so that many accumulators cover
+    /// every dimension, and a scalar merge scatters their lanes back. Longer
+    /// periods fall back to a scalar row sweep.
+    fn bbox_kernel<const CHECK_FINITE: bool>(self, out: &mut BBoxMut<'_>) -> bool {
+        let ndim = self.ndim();
+        let lo = &mut out.lo[..ndim];
+        let hi = &mut out.hi[..ndim];
+        lo.fill(f64::INFINITY);
+        hi.fill(f64::NEG_INFINITY);
 
-    let phases = ndim / gcd(ndim, LANES);
-    let mut nonfinite = Mask::<i64, LANES>::splat(false);
-    if phases <= MAX_PHASES {
-        let mut acc_lo = [F64s::splat(f64::INFINITY); MAX_PHASES];
-        let mut acc_hi = [F64s::splat(f64::NEG_INFINITY); MAX_PHASES];
-        let (chunks, rest) = data.as_chunks::<LANES>();
-        let mut phase = 0;
-        for c in chunks {
-            let v = F64s::from_array(*c);
-            acc_lo[phase] = vmin(v, acc_lo[phase]);
-            acc_hi[phase] = vmax(v, acc_hi[phase]);
-            if CHECK_FINITE {
-                nonfinite |= nonfinite_lanes(v);
+        let data = self.flat();
+        let phases = ndim / gcd(ndim, LANES);
+        let mut nonfinite = Mask::<i64, LANES>::splat(false);
+        if phases <= MAX_PHASES {
+            let mut acc_lo = [F64s::splat(f64::INFINITY); MAX_PHASES];
+            let mut acc_hi = [F64s::splat(f64::NEG_INFINITY); MAX_PHASES];
+            let (chunks, rest) = data.as_chunks::<LANES>();
+            let mut phase = 0;
+            for c in chunks {
+                let v = F64s::from_array(*c);
+                acc_lo[phase] = vmin(v, acc_lo[phase]);
+                acc_hi[phase] = vmax(v, acc_hi[phase]);
+                if CHECK_FINITE {
+                    nonfinite |= nonfinite_lanes(v);
+                }
+                phase += 1;
+                if phase == phases {
+                    phase = 0;
+                }
             }
-            phase += 1;
-            if phase == phases {
-                phase = 0;
+            for (i, (al, ah)) in acc_lo[..phases].iter().zip(&acc_hi[..phases]).enumerate() {
+                for j in 0..LANES {
+                    let dim = (i * LANES + j) % ndim;
+                    lo[dim] = lo[dim].min(al[j]);
+                    hi[dim] = hi[dim].max(ah[j]);
+                }
             }
-        }
-        for (i, (al, ah)) in acc_lo[..phases].iter().zip(&acc_hi[..phases]).enumerate() {
-            for j in 0..LANES {
-                let dim = (i * LANES + j) % ndim;
-                lo[dim] = lo[dim].min(al[j]);
-                hi[dim] = hi[dim].max(ah[j]);
-            }
-        }
-        let mut dim = (chunks.len() * LANES) % ndim;
-        for &v in rest {
-            lo[dim] = lo[dim].min(v);
-            hi[dim] = hi[dim].max(v);
-            if CHECK_FINITE && !v.is_finite() {
-                return false;
-            }
-            dim += 1;
-            if dim == ndim {
-                dim = 0;
-            }
-        }
-    } else {
-        for coords in data.chunks_exact(ndim) {
-            for ((l, h), &v) in lo.iter_mut().zip(hi.iter_mut()).zip(coords) {
-                *l = l.min(v);
-                *h = h.max(v);
+            let mut dim = (chunks.len() * LANES) % ndim;
+            for &v in rest {
+                lo[dim] = lo[dim].min(v);
+                hi[dim] = hi[dim].max(v);
                 if CHECK_FINITE && !v.is_finite() {
                     return false;
                 }
+                dim += 1;
+                if dim == ndim {
+                    dim = 0;
+                }
+            }
+        } else {
+            for coords in self.iter() {
+                for ((l, h), &v) in lo.iter_mut().zip(hi.iter_mut()).zip(coords) {
+                    *l = l.min(v);
+                    *h = h.max(v);
+                    if CHECK_FINITE && !v.is_finite() {
+                        return false;
+                    }
+                }
             }
         }
+        !CHECK_FINITE || !nonfinite.any()
     }
-    !CHECK_FINITE || !nonfinite.any()
 }
 
 fn gcd(mut a: usize, mut b: usize) -> usize {
@@ -200,17 +171,19 @@ fn gcd(mut a: usize, mut b: usize) -> usize {
     a
 }
 
-// --- query to point ---------------------------------------------------------
-
-/// Reduced distance between two points, returning early as soon as a chunk's
-/// running total exceeds `bound`.
-#[inline]
-pub(crate) fn point_rd(m: Metric, lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
-    match m {
+/// `inline(always)`, not `inline`: this is the body of [`Scan::streamed`]'s
+/// loop. `codegen-units = 1` makes the size heuristic depend on the whole
+/// crate's code, so growing anything anywhere can silently demote this to a real
+/// call per point — 12% on d16 leaf scans when it happened. `nm | grep point_rd`
+/// finding a symbol means it has.
+#[inline(always)]
+fn point_rd(m: Metric, lhs: &[f64], rhs: &[f64], bound: Rd) -> Rd {
+    let bound = bound.get();
+    Rd::reduced(match m {
         Metric::L1 | Metric::L2 => point_rd_sum(m, lhs, rhs, bound),
         Metric::LInf => point_rd_linf(lhs, rhs, bound),
         Metric::LP(p) => point_rd_lp(p, lhs, rhs, bound),
-    }
+    })
 }
 
 fn point_rd_sum(m: Metric, lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
@@ -226,9 +199,8 @@ fn point_rd_sum(m: Metric, lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
     fold_scalar(m, rd, l_rest, r_rest)
 }
 
-/// `L^inf` needs neither a horizontal reduction per chunk nor a scalar
-/// accumulator: the running maximum stays lane-wise, the early exit is a
-/// mask test, and a single horizontal max happens on the way out.
+/// A max fold needs no horizontal reduction per chunk: the running maximum
+/// stays lane-wise and one `hmax` happens on the way out.
 fn point_rd_linf(lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
     let (l_chunks, l_rest) = lhs.as_chunks::<LANES>();
     let (r_chunks, r_rest) = rhs.as_chunks::<LANES>();
@@ -246,8 +218,6 @@ fn point_rd_linf(lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
     fold_scalar(Metric::LInf, hmax(vm), l_rest, r_rest)
 }
 
-/// `powf` has no SIMD lowering, so `L^p` keeps a scalar loop with the same
-/// chunk-granular early exit as the SIMD paths.
 fn point_rd_lp(p: f64, lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
     let mut rd = 0.0_f64;
     for (l, r) in lhs.chunks(LANES).zip(rhs.chunks(LANES)) {
@@ -261,257 +231,268 @@ fn point_rd_lp(p: f64, lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
     rd
 }
 
-// --- query to leaf block ----------------------------------------------------
+/// `bound` is called once per scan plus once per accepted candidate, never per
+/// point — [`Scan`] threads the value through its loops to keep it that way.
+pub(crate) trait Sink {
+    fn bound(&self) -> Rd;
+    fn offer(&mut self, offset: usize, rd: Rd);
+}
 
-/// Scan a whole leaf block against `bound`, invoking `on_hit(offset,
-/// reduced_distance)` for every point within it. `on_hit` returns the
-/// tightened bound to use from that point on.
-///
-/// Rows of 1-4 dims are too short for [`point_rd`]'s early exit to save
-/// anything, so they get branch-free kernels that vectorize across points
-/// and keep distances in registers, leaving the SIMD domain only for the
-/// (rare) in-bound candidates: d1 rows are contiguous scalars LLVM
-/// vectorizes directly, d2-d4 get one swizzle recipe each on the shared
-/// [`scan_chunks`] driver. Everything else scans point by point with the
-/// early exit.
-pub(crate) fn scan_leaf(
-    m: Metric,
-    q: &[f64],
-    block: &[f64],
-    mut bound: f64,
-    mut on_hit: impl FnMut(usize, f64) -> f64,
-) {
-    if let Metric::LP(_) = m {
-        return scan_points(m, q, block, bound, &mut on_hit);
-    }
-    match q.len() {
-        1 => scan_rows::<1>(m, q, block, 0, &mut bound, &mut on_hit),
-        2 => scan_d2(m, q, block, &mut bound, &mut on_hit),
-        3 => scan_d3(m, q, block, &mut bound, &mut on_hit),
-        4 => scan_d4(m, q, block, &mut bound, &mut on_hit),
-        5 => scan_rows::<5>(m, q, block, 0, &mut bound, &mut on_hit),
-        6 => scan_rows::<6>(m, q, block, 0, &mut bound, &mut on_hit),
-        7 => scan_rows::<7>(m, q, block, 0, &mut bound, &mut on_hit),
-        8 => scan_d8(m, q, block, &mut bound, &mut on_hit),
-        _ => scan_points(m, q, block, bound, &mut on_hit),
+/// Which strategy applies is fixed by `(metric, row width)`, both constant for a
+/// whole `query` call, so the descent resolves it once per call and each descent
+/// then carries only the strategy it uses. Inlining every strategy into one
+/// descent instead costs the short-row queries the instruction cache for paths
+/// they never take (8-11% on d3), and hoisting only [`Streamed`] out of line
+/// costs the wide-row queries the same.
+pub(crate) trait Strategy {
+    fn scan<S: Sink>(m: Metric, q: &[f64], block: Rows<'_>, sink: &mut S);
+}
+
+const MAX_PACKED_WIDTH: usize = LANES;
+
+/// The gate that makes [`Packed`]'s width match total.
+pub(crate) fn packs(m: Metric, ndim: usize) -> bool {
+    !matches!(m, Metric::LP(_)) && ndim <= MAX_PACKED_WIDTH
+}
+
+/// Rows short enough that [`point_rd`]'s early exit would save nothing: pack
+/// several points per step, stay branch-free, and leave the SIMD domain only for
+/// the rare in-bound candidates.
+pub(crate) struct Packed;
+
+impl Strategy for Packed {
+    fn scan<S: Sink>(m: Metric, q: &[f64], block: Rows<'_>, sink: &mut S) {
+        let bound = sink.bound();
+        let mut scan = Scan {
+            m,
+            q,
+            flat: block.flat(),
+            sink,
+        };
+        match block.ndim() {
+            1 => scan.unrolled::<1>(bound),
+            2 => scan.d2(bound),
+            3 => scan.d3(bound),
+            4 => scan.d4(bound),
+            5 => scan.unrolled::<5>(bound),
+            6 => scan.unrolled::<6>(bound),
+            7 => scan.unrolled::<7>(bound),
+            8 => scan.d8(bound),
+            _ => unreachable!("`packs` routes wider rows to `Streamed`"),
+        };
     }
 }
 
-/// Per-point scan whose [`point_rd`] early exit skips most of each row once
-/// the bound tightens.
-fn scan_points(
-    m: Metric,
-    q: &[f64],
-    block: &[f64],
-    mut bound: f64,
-    on_hit: &mut impl FnMut(usize, f64) -> f64,
-) {
-    let ndim = q.len();
-    for (j, coords) in block.chunks_exact(ndim).enumerate() {
-        let rd = point_rd(m, q, coords, bound);
-        if rd <= bound {
-            bound = on_hit(j, rd);
+/// Rows long enough that the early exit skips most of each one once the bound
+/// tightens, which beats packing — and the only option for `L^p`.
+pub(crate) struct Streamed;
+
+impl Strategy for Streamed {
+    fn scan<S: Sink>(m: Metric, q: &[f64], block: Rows<'_>, sink: &mut S) {
+        let bound = sink.bound();
+        Scan {
+            m,
+            q,
+            flat: block.flat(),
+            sink,
         }
+        .streamed(bound);
     }
 }
 
-/// Scalar per-point scan for a compile-time row width: the axis loop fully
-/// unrolls, and with no early exit LLVM vectorizes it across points. Also
-/// serves as the sub-chunk tail of the d2-d4 kernels.
-#[inline(always)]
-fn scan_rows<const D: usize>(
+/// The pruning bound is deliberately not a field here. It only ever tightens, so
+/// it flows in and out of every method as a value — which both says what it is
+/// and keeps it in a register; as a field behind `&mut self` it becomes a load
+/// per point, ~10% on the short-row kernels.
+struct Scan<'a, S: Sink> {
     m: Metric,
-    q: &[f64],
-    rows: &[f64],
-    base: usize,
-    bound: &mut f64,
-    on_hit: &mut impl FnMut(usize, f64) -> f64,
-) {
-    let q = q.first_chunk::<D>().expect("row width exceeds query");
-    for (j, p) in rows.as_chunks::<D>().0.iter().enumerate() {
-        let rd = fold_scalar(m, 0.0, q, p);
-        if rd <= *bound {
-            *bound = on_hit(base + j, rd);
+    q: &'a [f64],
+    flat: &'a [f64],
+    sink: &'a mut S,
+}
+
+impl<S: Sink> Scan<'_, S> {
+    #[inline(always)]
+    fn offer(&mut self, offset: usize, rd: Rd) -> Rd {
+        self.sink.offer(offset, rd);
+        self.sink.bound()
+    }
+
+    #[inline(always)]
+    fn streamed(&mut self, mut bound: Rd) -> Rd {
+        let (m, q, flat) = (self.m, self.q, self.flat);
+        for (j, coords) in flat.chunks_exact(q.len()).enumerate() {
+            let rd = point_rd(m, q, coords, bound);
+            if rd <= bound {
+                bound = self.offer(j, rd);
+            }
         }
+        bound
     }
-}
 
-/// One 8-d point per register, eight points per chunk.
-///
-/// Every other block kernel packs several short points into one register and
-/// de-interleaves them; at `d == LANES` a point already fills a register, so
-/// the shape is the mirror image — eight independent vectors folded together.
-/// `scan_points` would instead reduce each point on its own, which costs a
-/// full `hsum` per point and, worse, serializes on one dependency chain that
-/// the `rd > bound` test cannot even exit early from at this width (a
-/// `LANES`-wide row is a single chunk). Three butterfly rounds fold all eight
-/// at once: half the shuffles, eight independent chains.
-fn scan_d8(
-    m: Metric,
-    q: &[f64],
-    block: &[f64],
-    bound: &mut f64,
-    on_hit: &mut impl FnMut(usize, f64) -> f64,
-) {
-    let pattern = F64s::from_slice(q);
-    scan_chunks::<{ LANES * LANES }, LANES, LANES>(m, q, block, bound, on_hit, |c| {
-        let axes: [F64s; LANES] =
-            std::array::from_fn(|i| axes_lanes(m, F64s::from_slice(&c[i * LANES..]) - pattern));
-        // `fold(a, b)` pairs adjacent lanes within each source, leaving a's
-        // partials in lanes 0..4 and b's in lanes 4..8; three rounds thus
-        // land the fold of `axes[j]` in lane `j`.
-        let fold = |a: F64s, b: F64s| {
+    /// A compile-time width unrolls the axis loop, and with no early exit LLVM
+    /// vectorizes it across points.
+    #[inline(always)]
+    fn unrolled<const D: usize>(&mut self, bound: Rd) -> Rd {
+        let flat = self.flat;
+        self.unrolled_from::<D>(flat, 0, bound)
+    }
+
+    #[inline(always)]
+    fn unrolled_from<const D: usize>(&mut self, rows: &[f64], base: usize, mut bound: Rd) -> Rd {
+        let (m, q) = (self.m, self.q);
+        let q = q.first_chunk::<D>().expect("row width exceeds query");
+        for (j, p) in rows.as_chunks::<D>().0.iter().enumerate() {
+            let rd = Rd::reduced(fold_scalar(m, 0.0, q, p));
+            if rd <= bound {
+                bound = self.offer(base + j, rd);
+            }
+        }
+        bound
+    }
+
+    /// Walk the block in `CHUNK`-element groups of `P` points, turn each into a
+    /// `P`-lane reduced-distance vector, and fan the rare in-bound lanes out to
+    /// the sink; the leftover falls through to the scalar `D`-wide scan. Every
+    /// kernel below is this driver plus a swizzle recipe.
+    #[inline(always)]
+    fn packed<const CHUNK: usize, const P: usize, const D: usize>(
+        &mut self,
+        mut bound: Rd,
+        rds_of: impl Fn(&[f64; CHUNK]) -> Simd<f64, P>,
+    ) -> Rd {
+        debug_assert_eq!(CHUNK, P * D);
+        let (chunks, rest) = self.flat.as_chunks::<CHUNK>();
+        let mut bound_v = Simd::splat(bound.get());
+        for (i, c) in chunks.iter().enumerate() {
+            let rds = rds_of(c);
+            if rds.simd_le(bound_v).any() {
+                bound = self.emit(rds, i * P, bound);
+                bound_v = Simd::splat(bound.get());
+            }
+        }
+        self.unrolled_from::<D>(rest, chunks.len() * P, bound)
+    }
+
+    #[inline(always)]
+    fn emit<const N: usize>(&mut self, rds: Simd<f64, N>, base: usize, mut bound: Rd) -> Rd {
+        for (j, &rd) in rds.as_array().iter().enumerate() {
+            let rd = Rd::reduced(rd);
+            if rd <= bound {
+                bound = self.offer(base + j, rd);
+            }
+        }
+        bound
+    }
+
+    /// Four 2-d points per register: `[x0 y0 x1 y1 x2 y2 x3 y3]`.
+    #[inline(always)]
+    fn d2(&mut self, bound: Rd) -> Rd {
+        let (m, q) = (self.m, self.q);
+        let pattern = F64s::from_array([q[0], q[1], q[0], q[1], q[0], q[1], q[0], q[1]]);
+        self.packed::<LANES, 4, 2>(bound, |c| {
+            let axes = axes_lanes(m, F64s::from_array(*c) - pattern);
+            let x = simd_swizzle!(axes, [0, 2, 4, 6]);
+            let y = simd_swizzle!(axes, [1, 3, 5, 7]);
+            combine(m, x, y)
+        })
+    }
+
+    /// Eight 3-d points across three registers: 24 lanes hold
+    /// `[p0.xyz p1.xyz .. p7.xyz]`. An odd width never aligns points to register
+    /// boundaries, so each axis vector has to be gathered from all three sources
+    /// — hence two swizzles per axis before the lane-wise combine.
+    #[inline(always)]
+    fn d3(&mut self, bound: Rd) -> Rd {
+        let (m, q) = (self.m, self.q);
+        let pat0 = F64s::from_array([q[0], q[1], q[2], q[0], q[1], q[2], q[0], q[1]]);
+        let pat1 = F64s::from_array([q[2], q[0], q[1], q[2], q[0], q[1], q[2], q[0]]);
+        let pat2 = F64s::from_array([q[1], q[2], q[0], q[1], q[2], q[0], q[1], q[2]]);
+        self.packed::<{ 3 * LANES }, LANES, 3>(bound, |c| {
+            let a0 = axes_lanes(m, F64s::from_slice(&c[..8]) - pat0);
+            let a1 = axes_lanes(m, F64s::from_slice(&c[8..16]) - pat1);
+            let a2 = axes_lanes(m, F64s::from_slice(&c[16..]) - pat2);
+            let xs = simd_swizzle!(
+                simd_swizzle!(a0, a1, [0, 3, 6, 9, 12, 15, 0, 0]),
+                a2,
+                [0, 1, 2, 3, 4, 5, 10, 13]
+            );
+            let ys = simd_swizzle!(
+                simd_swizzle!(a0, a1, [1, 4, 7, 10, 13, 0, 0, 0]),
+                a2,
+                [0, 1, 2, 3, 4, 8, 11, 14]
+            );
+            let zs = simd_swizzle!(
+                simd_swizzle!(a0, a1, [2, 5, 8, 11, 14, 0, 0, 0]),
+                a2,
+                [0, 1, 2, 3, 4, 9, 12, 15]
+            );
+            combine(m, combine(m, xs, ys), zs)
+        })
+    }
+
+    /// Two 4-d points per register: `[p0: 0..4 | p1: 0..4]`. The first combine
+    /// folds each half to two lanes, the second to one.
+    #[inline(always)]
+    fn d4(&mut self, bound: Rd) -> Rd {
+        let (m, q) = (self.m, self.q);
+        let pattern = F64s::from_array([q[0], q[1], q[2], q[3], q[0], q[1], q[2], q[3]]);
+        self.packed::<LANES, 2, 4>(bound, |c| {
+            let axes = axes_lanes(m, F64s::from_array(*c) - pattern);
+            let pairs = combine(
+                m,
+                simd_swizzle!(axes, [0, 1, 4, 5]),
+                simd_swizzle!(axes, [2, 3, 6, 7]),
+            );
             combine(
                 m,
-                simd_swizzle!(a, b, [0, 2, 4, 6, 8, 10, 12, 14]),
-                simd_swizzle!(a, b, [1, 3, 5, 7, 9, 11, 13, 15]),
+                simd_swizzle!(pairs, [0, 2]),
+                simd_swizzle!(pairs, [1, 3]),
             )
-        };
-        let r0 = fold(axes[0], axes[1]);
-        let r1 = fold(axes[2], axes[3]);
-        let r2 = fold(axes[4], axes[5]);
-        let r3 = fold(axes[6], axes[7]);
-        fold(fold(r0, r1), fold(r2, r3))
-    });
-}
-
-/// Drive one branch-free block kernel: walk `block` in `CHUNK`-element
-/// groups of `P` points, let `rds_of` turn each group into a `P`-lane
-/// reduced-distance vector, and fan the (rare) in-bound lanes out to
-/// `on_hit`. The sub-chunk leftover falls through to the scalar `D`-wide row
-/// scan. The d2-d4 kernels are this driver plus a swizzle recipe.
-#[inline(always)]
-fn scan_chunks<const CHUNK: usize, const P: usize, const D: usize>(
-    m: Metric,
-    q: &[f64],
-    block: &[f64],
-    bound: &mut f64,
-    on_hit: &mut impl FnMut(usize, f64) -> f64,
-    rds_of: impl Fn(&[f64; CHUNK]) -> Simd<f64, P>,
-) {
-    debug_assert_eq!(CHUNK, P * D);
-    let (chunks, rest) = block.as_chunks::<CHUNK>();
-    let mut bound_v = Simd::splat(*bound);
-    for (i, c) in chunks.iter().enumerate() {
-        let rds = rds_of(c);
-        if rds.simd_le(bound_v).any() {
-            emit_hits(rds, i * P, bound, on_hit);
-            bound_v = Simd::splat(*bound);
-        }
+        })
     }
-    scan_rows::<D>(m, q, rest, chunks.len() * P, bound, on_hit);
-}
 
-/// Four 2-d points per register: lanes hold `[x0 y0 x1 y1 x2 y2 x3 y3]`.
-fn scan_d2(
-    m: Metric,
-    q: &[f64],
-    block: &[f64],
-    bound: &mut f64,
-    on_hit: &mut impl FnMut(usize, f64) -> f64,
-) {
-    let pattern = F64s::from_array([q[0], q[1], q[0], q[1], q[0], q[1], q[0], q[1]]);
-    scan_chunks::<LANES, 4, 2>(m, q, block, bound, on_hit, |c| {
-        let axes = axes_lanes(m, F64s::from_array(*c) - pattern);
-        let x = simd_swizzle!(axes, [0, 2, 4, 6]);
-        let y = simd_swizzle!(axes, [1, 3, 5, 7]);
-        combine(m, x, y)
-    });
-}
-
-/// Eight 3-d points per three registers: 24 contiguous lanes hold
-/// `[p0.xyz p1.xyz .. p7.xyz]`. An odd row width never aligns points to
-/// register boundaries, so two-vector swizzles de-interleave the three
-/// axis vectors into per-axis vectors (each needs two swizzles because its
-/// lanes span all three sources) before the lane-wise combine.
-fn scan_d3(
-    m: Metric,
-    q: &[f64],
-    block: &[f64],
-    bound: &mut f64,
-    on_hit: &mut impl FnMut(usize, f64) -> f64,
-) {
-    let pat0 = F64s::from_array([q[0], q[1], q[2], q[0], q[1], q[2], q[0], q[1]]);
-    let pat1 = F64s::from_array([q[2], q[0], q[1], q[2], q[0], q[1], q[2], q[0]]);
-    let pat2 = F64s::from_array([q[1], q[2], q[0], q[1], q[2], q[0], q[1], q[2]]);
-    scan_chunks::<{ 3 * LANES }, LANES, 3>(m, q, block, bound, on_hit, |c| {
-        let a0 = axes_lanes(m, F64s::from_slice(&c[..8]) - pat0);
-        let a1 = axes_lanes(m, F64s::from_slice(&c[8..16]) - pat1);
-        let a2 = axes_lanes(m, F64s::from_slice(&c[16..]) - pat2);
-        let xs = simd_swizzle!(
-            simd_swizzle!(a0, a1, [0, 3, 6, 9, 12, 15, 0, 0]),
-            a2,
-            [0, 1, 2, 3, 4, 5, 10, 13]
-        );
-        let ys = simd_swizzle!(
-            simd_swizzle!(a0, a1, [1, 4, 7, 10, 13, 0, 0, 0]),
-            a2,
-            [0, 1, 2, 3, 4, 8, 11, 14]
-        );
-        let zs = simd_swizzle!(
-            simd_swizzle!(a0, a1, [2, 5, 8, 11, 14, 0, 0, 0]),
-            a2,
-            [0, 1, 2, 3, 4, 9, 12, 15]
-        );
-        combine(m, combine(m, xs, ys), zs)
-    });
-}
-
-/// Two 4-d points per register: lanes hold `[p0: 0..4 | p1: 0..4]`.
-fn scan_d4(
-    m: Metric,
-    q: &[f64],
-    block: &[f64],
-    bound: &mut f64,
-    on_hit: &mut impl FnMut(usize, f64) -> f64,
-) {
-    let pattern = F64s::from_array([q[0], q[1], q[2], q[3], q[0], q[1], q[2], q[3]]);
-    scan_chunks::<LANES, 2, 4>(m, q, block, bound, on_hit, |c| {
-        let axes = axes_lanes(m, F64s::from_array(*c) - pattern);
-        let pairs = combine(
-            m,
-            simd_swizzle!(axes, [0, 1, 4, 5]),
-            simd_swizzle!(axes, [2, 3, 6, 7]),
-        );
-        combine(
-            m,
-            simd_swizzle!(pairs, [0, 2]),
-            simd_swizzle!(pairs, [1, 3]),
-        )
-    });
-}
-
-/// Fan the in-bound lanes of a reduced-distance vector out to `on_hit`.
-/// Callers re-splat their vector bound afterwards, since a hit tightens it.
-#[inline(always)]
-fn emit_hits<const N: usize>(
-    rds: Simd<f64, N>,
-    base: usize,
-    bound: &mut f64,
-    on_hit: &mut impl FnMut(usize, f64) -> f64,
-) {
-    for (j, &rd) in rds.as_array().iter().enumerate() {
-        if rd <= *bound {
-            *bound = on_hit(base + j, rd);
-        }
+    /// At `d == LANES` a point already fills a register, so this is the mirror
+    /// image of the kernels above: eight whole vectors folded together rather
+    /// than one register de-interleaved. Reducing each point on its own would
+    /// cost an `hsum` apiece and serialize on one dependency chain that the
+    /// early exit cannot leave at this width (a `LANES`-wide row is one chunk).
+    #[inline(always)]
+    fn d8(&mut self, bound: Rd) -> Rd {
+        let (m, q) = (self.m, self.q);
+        let pattern = F64s::from_slice(q);
+        self.packed::<{ LANES * LANES }, LANES, LANES>(bound, |c| {
+            let axes: [F64s; LANES] =
+                std::array::from_fn(|i| axes_lanes(m, F64s::from_slice(&c[i * LANES..]) - pattern));
+            // `fold(a, b)` pairs adjacent lanes within each source, leaving a's
+            // partials in lanes 0..4 and b's in 4..8; three rounds thus land the
+            // fold of `axes[j]` in lane `j`.
+            let fold = |a: F64s, b: F64s| {
+                combine(
+                    m,
+                    simd_swizzle!(a, b, [0, 2, 4, 6, 8, 10, 12, 14]),
+                    simd_swizzle!(a, b, [1, 3, 5, 7, 9, 11, 13, 15]),
+                )
+            };
+            let r0 = fold(axes[0], axes[1]);
+            let r1 = fold(axes[2], axes[3]);
+            let r2 = fold(axes[4], axes[5]);
+            let r3 = fold(axes[6], axes[7]);
+            fold(fold(r0, r1), fold(r2, r3))
+        })
     }
 }
 
-// --- query to bounding box ---------------------------------------------------
-
-/// Reduced distance from `q` to the axis-aligned box `[lo, hi]`: zero when
-/// `q` is inside. Comparable against the same reduced domain as
-/// [`point_rd`].
+/// Zero when `q` is inside `b`. Comparable against [`point_rd`].
 #[inline]
-pub(crate) fn box_rd(m: Metric, q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
-    match m {
-        Metric::L1 | Metric::L2 => box_rd_sum(m, q, lo, hi),
-        Metric::LInf => box_rd_linf(q, lo, hi),
-        Metric::LP(p) => box_rd_lp(p, q, lo, hi),
-    }
+pub(crate) fn box_rd(m: Metric, q: &[f64], b: BBox<'_>) -> Rd {
+    Rd::reduced(match m {
+        Metric::L1 | Metric::L2 => box_rd_sum(m, q, b.lo, b.hi),
+        Metric::LInf => box_rd_linf(q, b.lo, b.hi),
+        Metric::LP(p) => box_rd_lp(p, q, b.lo, b.hi),
+    })
 }
 
-/// Summing metrics (`L1`/`L2`) only; `L^inf` has its own max fold below.
 fn box_rd_sum(m: Metric, q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
     let (q_chunks, q_rest) = q.as_chunks::<LANES>();
     let (lo_chunks, lo_rest) = lo.as_chunks::<LANES>();
@@ -528,7 +509,7 @@ fn box_rd_sum(m: Metric, q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
     }
     let mut rd = if q_chunks.is_empty() { 0.0 } else { hsum(acc) };
     for ((&qs, &ls), &hs) in q_rest.iter().zip(lo_rest).zip(hi_rest) {
-        rd += m.axis_rd(box_axis_offset(qs, ls, hs));
+        rd += m.reduce(axis_offset(qs, ls, hs)).get();
     }
     rd
 }
@@ -536,7 +517,7 @@ fn box_rd_sum(m: Metric, q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
 fn box_rd_linf(q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
     let mut worst = 0.0_f64;
     for ((&qs, &ls), &hs) in q.iter().zip(lo).zip(hi) {
-        let off = box_axis_offset(qs, ls, hs);
+        let off = axis_offset(qs, ls, hs);
         if off > worst {
             worst = off;
         }
@@ -547,7 +528,7 @@ fn box_rd_linf(q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
 fn box_rd_lp(p: f64, q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
     let mut rd = 0.0_f64;
     for ((&qs, &ls), &hs) in q.iter().zip(lo).zip(hi) {
-        let off = box_axis_offset(qs, ls, hs);
+        let off = axis_offset(qs, ls, hs);
         if off > 0.0 {
             rd += off.powf(p);
         }

@@ -1,17 +1,45 @@
-//! The `L^p` metric algebra over *reduced distances*.
-//!
-//! A reduced distance (`rd` throughout the crate) is a metric-specific
-//! monotone image of the true distance: squared for `L2`, the p-th power
-//! for `L^p`, the plain value for `L1`/`L^inf`. Comparisons, pruning
-//! bounds, and accumulation all stay in this domain, so the root is taken
-//! once per emitted result instead of once per candidate. This module owns
-//! the per-axis algebra of that domain; the vectorized loops that apply it
-//! to points, leaf blocks, and bounding boxes live in `kernel.rs`.
-
 use crate::error::KDTreeError;
 
+/// A distance in the reduced (monotone-image) domain of some [`Metric`]:
+/// squared for `L2`, the p-th power for `L^p`, the plain value elsewhere.
+///
+/// Every comparison, pruning bound, and accumulation in the crate stays here, so
+/// the root is taken once per emitted result rather than once per candidate.
+/// Only meaningfully ordered against values of the same metric.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub(crate) struct Rd(f64);
+
+impl Rd {
+    pub(crate) const ZERO: Self = Self(0.0);
+    pub(crate) const INFINITY: Self = Self(f64::INFINITY);
+
+    /// Re-enter the domain with a value already in it — for kernels that fold
+    /// raw SIMD lanes. Named so every such site is greppable.
+    #[inline(always)]
+    pub(crate) const fn reduced(value: f64) -> Self {
+        Self(value)
+    }
+
+    #[inline(always)]
+    pub(crate) const fn get(self) -> f64 {
+        self.0
+    }
+
+    #[inline(always)]
+    pub(crate) fn min(self, other: Self) -> Self {
+        Self(self.0.min(other.0))
+    }
+
+    /// Scale by a factor that is itself already reduced ([`Metric::eps_factor`]).
+    #[inline(always)]
+    pub(crate) fn scaled(self, factor: f64) -> Self {
+        Self(self.0 * factor)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
-pub enum Metric {
+pub(crate) enum Metric {
     L1,
     L2,
     LInf,
@@ -19,7 +47,7 @@ pub enum Metric {
 }
 
 impl Metric {
-    pub fn new(p: f64) -> Result<Self, KDTreeError> {
+    pub(crate) fn new(p: f64) -> Result<Self, KDTreeError> {
         if p.is_infinite() && p.is_sign_positive() {
             return Ok(Self::LInf);
         }
@@ -35,70 +63,47 @@ impl Metric {
         }
     }
 
-    /// True distance -> reduced distance.
+    /// Takes a whole distance or a single axis offset — one axis reduces exactly
+    /// like a whole distance.
     #[inline]
-    pub fn reduce(self, distance: f64) -> f64 {
-        match self {
+    pub(crate) fn reduce(self, distance: f64) -> Rd {
+        debug_assert!(distance >= 0.0);
+        Rd(match self {
             Self::L2 => distance * distance,
             Self::LP(p) => distance.powf(p),
             Self::L1 | Self::LInf => distance,
-        }
+        })
     }
 
-    /// Reduced distance -> true distance; the inverse of [`Metric::reduce`].
     #[inline]
-    pub fn restore(self, rd: f64) -> f64 {
+    pub(crate) fn restore(self, rd: Rd) -> f64 {
         match self {
-            Self::L2 => rd.sqrt(),
-            Self::LP(p) => rd.powf(1.0 / p),
-            Self::L1 | Self::LInf => rd,
+            Self::L2 => rd.0.sqrt(),
+            Self::LP(p) => rd.0.powf(1.0 / p),
+            Self::L1 | Self::LInf => rd.0,
         }
     }
 
-    /// `(1 + eps)` carried into the reduced domain, so approximate-search
-    /// pruning multiplies lower bounds instead of re-rooting distances.
     #[inline]
-    pub fn eps_factor(self, eps: f64) -> f64 {
-        self.reduce(1.0 + eps)
+    pub(crate) fn eps_factor(self, eps: f64) -> f64 {
+        self.reduce(1.0 + eps).0
     }
 
-    /// Reduced contribution of one axis, from a non-negative offset. A single
-    /// axis reduces exactly like a whole distance; the separate name marks
-    /// the per-axis call sites.
     #[inline]
-    pub fn axis_rd(self, offset: f64) -> f64 {
-        debug_assert!(offset >= 0.0);
-        self.reduce(offset)
+    pub(crate) fn fold(self, rd: Rd, axis: Rd) -> Rd {
+        Rd(match self {
+            Self::LInf => rd.0.max(axis.0),
+            _ => rd.0 + axis.0,
+        })
     }
 
-    /// Fold one axis contribution into a running reduced distance: sum for
-    /// `L^p`, max for `L^inf`.
+    /// Requires `new >= old`, which holds whenever a descent moves from a parent
+    /// cell into the far child along the split.
     #[inline]
-    pub fn fold(self, rd: f64, axis: f64) -> f64 {
-        match self {
-            Self::LInf => rd.max(axis),
-            _ => rd + axis,
-        }
+    pub(crate) fn replace_axis(self, rd: Rd, old: Rd, new: Rd) -> Rd {
+        Rd(match self {
+            Self::LInf => rd.0.max(new.0),
+            _ => rd.0 - old.0 + new.0,
+        })
     }
-
-    /// Reduced distance after one axis's contribution changes from
-    /// `old_axis` to `new_axis`. The caller must guarantee
-    /// `new_axis >= old_axis`, which always holds when descending from a
-    /// parent cell into the far child along the split.
-    #[inline]
-    pub fn replace_axis(self, rd: f64, old_axis: f64, new_axis: f64) -> f64 {
-        match self {
-            Self::LInf => rd.max(new_axis),
-            _ => rd - old_axis + new_axis,
-        }
-    }
-}
-
-/// Per-axis offset from a coordinate to the interval `[lo, hi]`: zero
-/// inside. This is the definition every box bound in the crate computes;
-/// `kernel.rs`'s vector paths inline the same `max(lo - q, q - hi, 0)` with
-/// lane-wise maxima rather than calling it.
-#[inline(always)]
-pub fn box_axis_offset(q: f64, lo: f64, hi: f64) -> f64 {
-    (lo - q).max(q - hi).max(0.0)
 }
