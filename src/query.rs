@@ -1,24 +1,22 @@
 //! The descent prunes with two bounds, checked in order of cost: an
-//! O(1)-updatable lower bound on the distance from the query to the current cell
-//! (per-axis parts in [`CellBound`], the folded total passed down the
-//! recursion), and — only when that fails to prune — the tight box of the points
-//! the subtree actually contains. The tight box is what collapses degenerate
-//! clustered data, where every split lands on the same few dimensions and plane
-//! bounds stay uselessly small; the plane bound keeps the common well-separated
-//! descent free of O(ndim) box work.
+//! O(1)-updatable lower bound from the query to the current cell (per-axis parts
+//! in [`CellBound`], the folded total passed down the recursion), and — only when
+//! that fails to prune — the tight box of the points the subtree contains. The
+//! tight box is what collapses degenerate clustered data, where plane bounds stay
+//! uselessly small; the plane bound keeps the common well-separated descent free
+//! of O(ndim) box work.
 //!
-//! **Box distances gate visits and nothing else.** A child is always entered
-//! with a bound derived from [`CellBound`], never with its own box distance.
-//! Feed a box distance into the recursion and it drifts out of step with the
-//! per-axis breakdown, so every later `replace_axis` subtracts a contribution
-//! that is not in the total — silently wrong results, not a crash.
+//! **Box distances gate visits and nothing else.** A child is always entered with
+//! a bound derived from [`CellBound`], never with its own box distance. Feed a box
+//! distance into the recursion and every later `replace_axis` subtracts a
+//! contribution that is not in the total — silently wrong results, not a crash.
 
 use std::marker::PhantomData;
 
 use rayon::prelude::*;
 
 use crate::error::KDTreeError;
-use crate::kernel::{self, Packed, Streamed, Strategy};
+use crate::kernel::{self, Folded, Packed, Plan, Streamed, Strategy};
 use crate::layout::{BBox, axis_offset};
 use crate::metric::{Metric, Rd};
 use crate::tree::{Node, ROOT, Tree};
@@ -71,11 +69,16 @@ impl Tree {
         // const-folded kernels inline into `descend` and bloat it, where the
         // enum dispatch stays perfectly predicted.
         let args = (queries, k, params, parallel);
-        match (k == 1, kernel::packs(metric, self.ndim())) {
-            (true, true) => self.run::<Best1, Packed>(args, &mut distances, &mut indices),
-            (true, false) => self.run::<Best1, Streamed>(args, &mut distances, &mut indices),
-            (false, true) => self.run::<BestK, Packed>(args, &mut distances, &mut indices),
-            (false, false) => self.run::<BestK, Streamed>(args, &mut distances, &mut indices),
+        let (d, i) = (&mut distances, &mut indices);
+        match (k == 1, kernel::plan(metric, self.ndim())) {
+            (true, Plan::Packed) => self.run::<Best1, Packed>(args, d, i),
+            (true, Plan::FoldedAbs) => self.run::<Best1, Folded<false>>(args, d, i),
+            (true, Plan::FoldedSquared) => self.run::<Best1, Folded<true>>(args, d, i),
+            (true, Plan::Streamed) => self.run::<Best1, Streamed>(args, d, i),
+            (false, Plan::Packed) => self.run::<BestK, Packed>(args, d, i),
+            (false, Plan::FoldedAbs) => self.run::<BestK, Folded<false>>(args, d, i),
+            (false, Plan::FoldedSquared) => self.run::<BestK, Folded<true>>(args, d, i),
+            (false, Plan::Streamed) => self.run::<BestK, Streamed>(args, d, i),
         }
 
         Ok((distances, indices))
@@ -128,10 +131,9 @@ struct QueryParams {
     metric: Metric,
 }
 
-/// Allocated once per thread and reused across queries. Kept separate from
-/// [`Descent`] so the recursion borrows read-only context and mutable state
-/// independently — one `&mut` over both forces a context reload after every
-/// recursive call.
+/// Kept separate from [`Descent`] so the recursion borrows read-only context and
+/// mutable state independently — one `&mut` over both forces a context reload
+/// after every recursive call.
 struct Scratch<B> {
     cell: CellBound,
     best: B,
@@ -147,14 +149,12 @@ impl<B: Best> Scratch<B> {
 }
 
 /// The split-plane lower bound, kept as its per-axis contributions — the
-/// breakdown that makes `replace_axis` an O(1) update. The folded total is not
-/// here: it is per-frame and travels as a recursion argument, since shared
-/// mutable state would force a reload after every recursive call.
+/// breakdown that makes `replace_axis` an O(1) update. The folded total travels
+/// as a recursion argument instead, being per-frame.
 ///
-/// Invariant: all axes are zero between queries. That is already the answer for
-/// a query inside the root box, which is the overwhelmingly common case, so
-/// [`CellBound::start`] normally writes nothing and [`CellBound::finish`] has
-/// nothing to undo.
+/// Invariant: all axes are zero between queries. That is already the answer for a
+/// query inside the root box, the common case, so [`CellBound::start`] normally
+/// writes nothing and [`CellBound::finish`] has nothing to undo.
 struct CellBound {
     axes: Vec<Rd>,
     seeded: bool,
@@ -168,8 +168,6 @@ impl CellBound {
         }
     }
 
-    /// One vectorized box distance decides the common case, and that decision is
-    /// what inlines into the caller; the rare fill stays out of line.
     #[inline(always)]
     fn start(&mut self, m: Metric, q: &[f64], root: BBox<'_>) -> Rd {
         if kernel::box_rd(m, q, root) == Rd::ZERO {
@@ -238,8 +236,6 @@ impl<K: Strategy> Descent<'_, K> {
             .write_results(out_d, out_i, self.tree.n_points(), metric);
     }
 
-    /// The approximation factor scales the lower bound rather than the k-best
-    /// bound, so the comparison stays in the reduced domain.
     #[inline(always)]
     fn admits<B: Best>(&self, rd: Rd, s: &Scratch<B>) -> bool {
         rd.scaled(self.params.eps_factor) <= s.best.bound(self.params.cutoff)
@@ -295,11 +291,10 @@ impl<K: Strategy> Descent<'_, K> {
     }
 
     /// Visiting one child tightens the bound for the other, so both box gates are
-    /// tested as we go. Each child still descends on its plane bound (`cell_rd` /
-    /// `far_rd`) — see the module invariant.
+    /// tested as we go. Each child still descends on its plane bound — see the
+    /// module invariant.
     ///
-    /// Out of line so that flat data, which never sets the flag, pays only the
-    /// flag test.
+    /// Out of line so flat data, which never sets the flag, pays only the test.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn descend_by_box<B: Best>(
@@ -428,7 +423,6 @@ impl Best for Best1 {
     }
 }
 
-/// A sorted buffer, insertion-sorted on the fly.
 struct BestK {
     k: usize,
     rds: Vec<Rd>,

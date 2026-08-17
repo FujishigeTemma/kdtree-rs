@@ -1,11 +1,10 @@
 use crate::error::KDTreeError;
 
 /// A distance in the reduced (monotone-image) domain of some [`Metric`]:
-/// squared for `L2`, the p-th power for `L^p`, the plain value elsewhere.
-///
-/// Every comparison, pruning bound, and accumulation in the crate stays here, so
-/// the root is taken once per emitted result rather than once per candidate.
-/// Only meaningfully ordered against values of the same metric.
+/// squared for `L2`, the p-th power for `L^p`, the plain value elsewhere. Every
+/// comparison and accumulation in the crate stays here, so the root is taken once
+/// per emitted result rather than once per candidate. Only meaningfully ordered
+/// against values of the same metric.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub(crate) struct Rd(f64);

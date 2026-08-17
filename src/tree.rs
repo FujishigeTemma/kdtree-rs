@@ -1,8 +1,7 @@
-//! Nodes are laid out flat in preorder: a node's left subtree immediately
-//! follows it, then its right subtree. Points are physically reordered during
-//! the build so every subtree — in particular every leaf — owns one contiguous
-//! row-major block of `data`, and `indices[position]` maps back to the caller's
-//! original row.
+//! Nodes are laid out flat in preorder: a node's left subtree immediately follows
+//! it, then its right subtree. Points are physically reordered during the build so
+//! every subtree — in particular every leaf — owns one contiguous row-major block
+//! of `data`, and `indices[position]` maps back to the caller's original row.
 
 use crate::error::KDTreeError;
 use crate::layout::{BBox, Boxes, Dyn, Rows};
@@ -19,23 +18,18 @@ pub(crate) enum Node {
         left: u32,
         right: u32,
         split_dim: u32,
-        /// Both children shrank along every non-split dimension, which marks
-        /// data on a low-dimensional manifold: there the split plane is a poor
-        /// proxy for proximity, so queries order and prune this node's children
-        /// by tight-box distance instead.
+        /// Both children shrank along every non-split dimension, marking data on a
+        /// low-dimensional manifold where the split plane is a poor proxy for
+        /// proximity, so queries order and prune the children by box distance.
         order_by_box: bool,
         split_value: f64,
     },
 }
 
 pub struct Tree {
-    /// Row-major, in tree order (see module docs).
     pub(crate) data: Vec<f64>,
-    /// Tree position -> original row index.
     pub(crate) indices: Vec<u32>,
     pub(crate) nodes: Vec<Node>,
-    /// Tight per-node boxes, which bound the distance to a subtree by the points
-    /// it actually contains rather than by the split planes around it.
     pub(crate) boxes: Boxes,
     pub(crate) n_points: usize,
     pub(crate) ndim: usize,
@@ -43,8 +37,6 @@ pub struct Tree {
 }
 
 impl Tree {
-    /// Takes the data by value so the caller can drop any Python borrow before
-    /// calling and run this detached from the GIL.
     pub fn new(
         data: Vec<f64>,
         ndim: usize,
@@ -66,8 +58,6 @@ impl Tree {
         self.leafsize
     }
 
-    /// Only the `data` getter needs this; queries keep the tree order for
-    /// locality.
     pub fn original_data(&self) -> Vec<f64> {
         let mut original = vec![0.0_f64; self.n_points * self.ndim];
         for (pos, &original_idx) in self.indices.iter().enumerate() {

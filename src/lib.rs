@@ -48,7 +48,6 @@ struct Points {
     values: Vec<f64>,
     n_rows: usize,
     ndim: usize,
-    /// The caller passed one bare point, so `query` mirrors that shape back.
     single: bool,
 }
 

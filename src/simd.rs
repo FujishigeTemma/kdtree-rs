@@ -6,9 +6,9 @@ use std::simd::simd_swizzle;
 pub(crate) const LANES: usize = 8;
 pub(crate) type F64s = Simd<f64, LANES>;
 
-/// All coordinates are validated finite at construction, so NaN semantics never
-/// arise and compare+select lowers to one packed max. `SimdFloat::simd_max`'s
-/// maxNum semantics can require fixup sequences instead.
+/// All coordinates are validated finite, so NaN semantics never arise and
+/// compare+select lowers to one packed max; `SimdFloat::simd_max`'s maxNum
+/// semantics can require fixup sequences instead.
 #[inline(always)]
 pub(crate) fn vmax<const N: usize>(a: Simd<f64, N>, b: Simd<f64, N>) -> Simd<f64, N> {
     b.simd_gt(a).select(b, a)

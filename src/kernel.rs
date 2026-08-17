@@ -1,20 +1,16 @@
 //! Two rules hold across every distance kernel here:
 //!
-//! - reduced distances accumulate monotonically for every supported metric, so
-//!   a partial value already past the caller's bound is a valid answer;
-//! - bound checks happen once per SIMD chunk. Per axis, the horizontal
-//!   reduction serializes the kernel; per row, the early exit that saves most
-//!   of the work in high dimensions is gone.
+//! - reduced distances accumulate monotonically, so a partial value already past
+//!   the caller's bound is a valid answer;
+//! - bound checks happen once per SIMD chunk: per axis the horizontal reduction
+//!   serializes the kernel, per row the high-dimension early exit is gone.
 //!
-//! `powf` has no SIMD lowering, so a general `L^p` never reaches a vector
-//! kernel: `point_rd` and `box_rd` divert `Metric::LP` up front and [`packs`]
-//! routes it to [`Streamed`]. That is what makes the `LP` arms of `axes_lanes`
-//! and `fold_scalar` unreachable.
+//! `powf` has no SIMD lowering, so a general `L^p` never reaches a vector kernel
+//! — hence the unreachable `LP` arms of `axes_lanes` and `fold_scalar`.
 //!
 //! Narrowing the vector primitives to a three-variant enum removes those
-//! `unreachable!`s and reads better, but measured 10-25% slower on d8/d16 leaf
-//! scans with `leafsize = 128`. Only the effect was measured, not the cause —
-//! A/B it rather than assuming it is free.
+//! `unreachable!`s but measured 10-25% slower on d8/d16 leaf scans with
+//! `leafsize = 128`; cause unknown, so A/B it rather than assuming it is free.
 
 use std::simd::prelude::*;
 use std::simd::simd_swizzle;
@@ -40,8 +36,7 @@ fn combine<const N: usize>(m: Metric, a: Simd<f64, N>, b: Simd<f64, N>) -> Simd<
     }
 }
 
-/// The match stays outside the loop so each arm keeps a body tight enough for
-/// LLVM to unroll or vectorize.
+/// The match stays outside the loop so LLVM can unroll or vectorize each arm.
 #[inline(always)]
 fn fold_scalar(m: Metric, mut rd: f64, lhs: &[f64], rhs: &[f64]) -> f64 {
     match m {
@@ -69,8 +64,6 @@ fn fold_scalar(m: Metric, mut rd: f64, lhs: &[f64], rhs: &[f64]) -> f64 {
     rd
 }
 
-/// The build gets this check for free inside [`Rows::bbox_checked_into`];
-/// queries, which compute no box, need the standalone pass.
 pub(crate) fn all_finite(values: &[f64]) -> bool {
     let mut nonfinite = Mask::<i64, LANES>::splat(false);
     let (chunks, rest) = values.as_chunks::<LANES>();
@@ -80,8 +73,7 @@ pub(crate) fn all_finite(values: &[f64]) -> bool {
     !nonfinite.any() && rest.iter().all(|v| v.is_finite())
 }
 
-/// Covers every row width whose phase period is at most this many vectors: all
-/// of 1..=8, plus common wider even widths.
+/// Covers all of 1..=8, plus common wider even widths.
 const MAX_PHASES: usize = 8;
 
 impl<W: Width> Rows<'_, W> {
@@ -89,18 +81,15 @@ impl<W: Width> Rows<'_, W> {
         self.bbox_kernel::<false>(out);
     }
 
-    /// [`Rows::bbox_into`] with the finiteness check fused in; `false` when any
-    /// element is non-finite.
+    /// `false` when any element is non-finite.
     pub(crate) fn bbox_checked_into(self, out: &mut BBoxMut<'_>) -> bool {
         self.bbox_kernel::<true>(out)
     }
 
-    /// Chunking each row is useless for rows shorter than a vector, so the block
-    /// streams as flat `LANES`-wide vectors instead. Lane `j` of flat vector `i`
-    /// then holds dimension `(i * LANES + j) % ndim`, a pattern that repeats
-    /// every `ndim / gcd(ndim, LANES)` vectors — so that many accumulators cover
-    /// every dimension, and a scalar merge scatters their lanes back. Longer
-    /// periods fall back to a scalar row sweep.
+    /// The block streams as flat `LANES`-wide vectors, so lane `j` of vector `i`
+    /// holds dimension `(i * LANES + j) % ndim` — a pattern repeating every
+    /// `ndim / gcd(ndim, LANES)` vectors, hence one accumulator per phase and a
+    /// scalar merge to scatter their lanes back.
     fn bbox_kernel<const CHECK_FINITE: bool>(self, out: &mut BBoxMut<'_>) -> bool {
         let ndim = self.ndim();
         let lo = &mut out.lo[..ndim];
@@ -171,11 +160,10 @@ fn gcd(mut a: usize, mut b: usize) -> usize {
     a
 }
 
-/// `inline(always)`, not `inline`: this is the body of [`Scan::streamed`]'s
-/// loop. `codegen-units = 1` makes the size heuristic depend on the whole
-/// crate's code, so growing anything anywhere can silently demote this to a real
-/// call per point — 12% on d16 leaf scans when it happened. `nm | grep point_rd`
-/// finding a symbol means it has.
+/// `inline(always)`, not `inline`: with `codegen-units = 1` the size heuristic
+/// depends on the whole crate, so growing anything anywhere can demote this to a
+/// real call per point — 12% on d16 leaf scans when it happened. `nm | grep
+/// point_rd` finding a symbol means it has.
 #[inline(always)]
 fn point_rd(m: Metric, lhs: &[f64], rhs: &[f64], bound: Rd) -> Rd {
     let bound = bound.get();
@@ -199,8 +187,6 @@ fn point_rd_sum(m: Metric, lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
     fold_scalar(m, rd, l_rest, r_rest)
 }
 
-/// A max fold needs no horizontal reduction per chunk: the running maximum
-/// stays lane-wise and one `hmax` happens on the way out.
 fn point_rd_linf(lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
     let (l_chunks, l_rest) = lhs.as_chunks::<LANES>();
     let (r_chunks, r_rest) = rhs.as_chunks::<LANES>();
@@ -238,26 +224,39 @@ pub(crate) trait Sink {
     fn offer(&mut self, offset: usize, rd: Rd);
 }
 
-/// Which strategy applies is fixed by `(metric, row width)`, both constant for a
-/// whole `query` call, so the descent resolves it once per call and each descent
-/// then carries only the strategy it uses. Inlining every strategy into one
-/// descent instead costs the short-row queries the instruction cache for paths
-/// they never take (8-11% on d3), and hoisting only [`Streamed`] out of line
-/// costs the wide-row queries the same.
+/// Resolved once per `query` call so each descent carries only the strategy it
+/// uses. Inlining every strategy into one descent instead costs the short-row
+/// queries the instruction cache for paths they never take (8-11% on d3), and
+/// hoisting only [`Streamed`] out of line costs the wide-row queries the same.
 pub(crate) trait Strategy {
     fn scan<S: Sink>(m: Metric, q: &[f64], block: Rows<'_>, sink: &mut S);
 }
 
 const MAX_PACKED_WIDTH: usize = LANES;
 
-/// The gate that makes [`Packed`]'s width match total.
-pub(crate) fn packs(m: Metric, ndim: usize) -> bool {
-    !matches!(m, Metric::LP(_)) && ndim <= MAX_PACKED_WIDTH
+/// Two chunks is where the benchmark grid stops, so the threshold sits at the
+/// edge of what is measured rather than at a guess about wider rows.
+const MAX_FOLDED_WIDTH: usize = 2 * LANES;
+
+pub(crate) enum Plan {
+    Packed,
+    FoldedAbs,
+    FoldedSquared,
+    Streamed,
+}
+
+pub(crate) fn plan(m: Metric, ndim: usize) -> Plan {
+    match m {
+        Metric::L1 | Metric::L2 | Metric::LInf if ndim <= MAX_PACKED_WIDTH => Plan::Packed,
+        Metric::L1 if ndim <= MAX_FOLDED_WIDTH => Plan::FoldedAbs,
+        Metric::L2 if ndim <= MAX_FOLDED_WIDTH => Plan::FoldedSquared,
+        _ => Plan::Streamed,
+    }
 }
 
 /// Rows short enough that [`point_rd`]'s early exit would save nothing: pack
-/// several points per step, stay branch-free, and leave the SIMD domain only for
-/// the rare in-bound candidates.
+/// several points per step and leave the SIMD domain only for the rare in-bound
+/// candidates.
 pub(crate) struct Packed;
 
 impl Strategy for Packed {
@@ -283,8 +282,8 @@ impl Strategy for Packed {
     }
 }
 
-/// Rows long enough that the early exit skips most of each one once the bound
-/// tightens, which beats packing — and the only option for `L^p`.
+/// Rows long enough that the early exit beats packing — and the only option for
+/// `L^p`.
 pub(crate) struct Streamed;
 
 impl Strategy for Streamed {
@@ -300,10 +299,56 @@ impl Strategy for Streamed {
     }
 }
 
-/// The pruning bound is deliberately not a field here. It only ever tightens, so
-/// it flows in and out of every method as a value — which both says what it is
-/// and keeps it in a register; as a field behind `&mut self` it becomes a load
-/// per point, ~10% on the short-row kernels.
+/// Rows too wide for [`Packed`] but too short for [`Streamed`]'s mid-row bound
+/// check to pay for itself: the whole row accumulates lane-wise and reduces once.
+///
+/// Measured on d16, which is two chunks: -38% / -57% for `L1` and -12% / -12%
+/// for `L2`, at `leafsize` 8 / 128 on aarch64. `L2` gains less because its
+/// squared axes cross the bound more often, which is what pays for the check —
+/// extend [`MAX_FOLDED_WIDTH`] and that balance tips back.
+///
+/// Every loop that reaches a leaf has to stay monomorphic, hence the const axis
+/// reduction and a separate strategy: adding an `L1` arm to [`point_rd`] cost the
+/// *`L2`* d16 scans 12-14% on aarch64, reproducibly across three spellings, and
+/// padding the baseline with unrelated code moved it only 3%.
+pub(crate) struct Folded<const SQUARED: bool>;
+
+impl<const SQUARED: bool> Strategy for Folded<SQUARED> {
+    fn scan<S: Sink>(m: Metric, q: &[f64], block: Rows<'_>, sink: &mut S) {
+        debug_assert!(match m {
+            Metric::L1 => !SQUARED,
+            Metric::L2 => SQUARED,
+            _ => false,
+        });
+        let bound = sink.bound();
+        Scan {
+            m,
+            q,
+            flat: block.flat(),
+            sink,
+        }
+        .folded::<SQUARED>(bound);
+    }
+}
+
+/// `SQUARED` picks the axis reduction at compile time, so the `Metric` handed to
+/// [`axes_lanes`] and [`fold_scalar`] is a constant and both matches vanish.
+#[inline(always)]
+fn point_rd_folded<const SQUARED: bool>(lhs: &[f64], rhs: &[f64]) -> f64 {
+    let m = if SQUARED { Metric::L2 } else { Metric::L1 };
+    let (l_chunks, l_rest) = lhs.as_chunks::<LANES>();
+    let (r_chunks, r_rest) = rhs.as_chunks::<LANES>();
+    let mut acc = F64s::splat(0.0);
+    for (l, r) in l_chunks.iter().zip(r_chunks) {
+        acc += axes_lanes(m, F64s::from_array(*l) - F64s::from_array(*r));
+    }
+    let rd = if l_chunks.is_empty() { 0.0 } else { hsum(acc) };
+    fold_scalar(m, rd, l_rest, r_rest)
+}
+
+/// The pruning bound is deliberately not a field: it flows through every method
+/// as a value to stay in a register. As a field behind `&mut self` it becomes a
+/// load per point, ~10% on the short-row kernels.
 struct Scan<'a, S: Sink> {
     m: Metric,
     q: &'a [f64],
@@ -319,6 +364,18 @@ impl<S: Sink> Scan<'_, S> {
     }
 
     #[inline(always)]
+    fn folded<const SQUARED: bool>(&mut self, mut bound: Rd) -> Rd {
+        let (q, flat) = (self.q, self.flat);
+        for (j, coords) in flat.chunks_exact(q.len()).enumerate() {
+            let rd = Rd::reduced(point_rd_folded::<SQUARED>(q, coords));
+            if rd <= bound {
+                bound = self.offer(j, rd);
+            }
+        }
+        bound
+    }
+
+    #[inline(always)]
     fn streamed(&mut self, mut bound: Rd) -> Rd {
         let (m, q, flat) = (self.m, self.q, self.flat);
         for (j, coords) in flat.chunks_exact(q.len()).enumerate() {
@@ -331,7 +388,7 @@ impl<S: Sink> Scan<'_, S> {
     }
 
     /// A compile-time width unrolls the axis loop, and with no early exit LLVM
-    /// vectorizes it across points.
+    /// vectorizes across points.
     #[inline(always)]
     fn unrolled<const D: usize>(&mut self, bound: Rd) -> Rd {
         let flat = self.flat;
@@ -353,8 +410,7 @@ impl<S: Sink> Scan<'_, S> {
 
     /// Walk the block in `CHUNK`-element groups of `P` points, turn each into a
     /// `P`-lane reduced-distance vector, and fan the rare in-bound lanes out to
-    /// the sink; the leftover falls through to the scalar `D`-wide scan. Every
-    /// kernel below is this driver plus a swizzle recipe.
+    /// the sink. Every kernel below is this driver plus a swizzle recipe.
     #[inline(always)]
     fn packed<const CHUNK: usize, const P: usize, const D: usize>(
         &mut self,
@@ -399,9 +455,8 @@ impl<S: Sink> Scan<'_, S> {
     }
 
     /// Eight 3-d points across three registers: 24 lanes hold
-    /// `[p0.xyz p1.xyz .. p7.xyz]`. An odd width never aligns points to register
-    /// boundaries, so each axis vector has to be gathered from all three sources
-    /// — hence two swizzles per axis before the lane-wise combine.
+    /// `[p0.xyz p1.xyz .. p7.xyz]`. An odd width aligns to no register boundary,
+    /// so each axis vector is gathered from all three sources.
     #[inline(always)]
     fn d3(&mut self, bound: Rd) -> Rd {
         let (m, q) = (self.m, self.q);
@@ -431,8 +486,7 @@ impl<S: Sink> Scan<'_, S> {
         })
     }
 
-    /// Two 4-d points per register: `[p0: 0..4 | p1: 0..4]`. The first combine
-    /// folds each half to two lanes, the second to one.
+    /// Two 4-d points per register: `[p0: 0..4 | p1: 0..4]`.
     #[inline(always)]
     fn d4(&mut self, bound: Rd) -> Rd {
         let (m, q) = (self.m, self.q);
@@ -452,11 +506,10 @@ impl<S: Sink> Scan<'_, S> {
         })
     }
 
-    /// At `d == LANES` a point already fills a register, so this is the mirror
-    /// image of the kernels above: eight whole vectors folded together rather
-    /// than one register de-interleaved. Reducing each point on its own would
-    /// cost an `hsum` apiece and serialize on one dependency chain that the
-    /// early exit cannot leave at this width (a `LANES`-wide row is one chunk).
+    /// At `d == LANES` a point already fills a register: eight whole vectors
+    /// folded together rather than one register de-interleaved. Reducing each
+    /// point on its own would cost an `hsum` apiece and serialize on one
+    /// dependency chain, which at this width the early exit cannot leave.
     #[inline(always)]
     fn d8(&mut self, bound: Rd) -> Rd {
         let (m, q) = (self.m, self.q);
@@ -465,8 +518,8 @@ impl<S: Sink> Scan<'_, S> {
             let axes: [F64s; LANES] =
                 std::array::from_fn(|i| axes_lanes(m, F64s::from_slice(&c[i * LANES..]) - pattern));
             // `fold(a, b)` pairs adjacent lanes within each source, leaving a's
-            // partials in lanes 0..4 and b's in 4..8; three rounds thus land the
-            // fold of `axes[j]` in lane `j`.
+            // partials in lanes 0..4 and b's in 4..8; three rounds land the fold
+            // of `axes[j]` in lane `j`.
             let fold = |a: F64s, b: F64s| {
                 combine(
                     m,

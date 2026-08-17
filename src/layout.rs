@@ -22,8 +22,8 @@ impl<const N: usize> Width for Fixed<N> {
     }
 }
 
-/// The width list is the call site's own tuning table; nothing requires two
-/// call sites to agree on it.
+/// The width list is the call site's own tuning table; nothing requires two call
+/// sites to agree on it.
 macro_rules! with_width {
     ($ndim:expr, [$($n:literal),* $(,)?], |$w:ident| $body:expr) => {{
         match $ndim {
@@ -142,8 +142,7 @@ impl<'a, W: Width> RowsMut<'a, W> {
     }
 }
 
-/// Offset from a coordinate to the interval `[lo, hi]`; zero inside. The vector
-/// paths inline this same expression with lane-wise maxima.
+/// Offset from a coordinate to the interval `[lo, hi]`; zero inside.
 #[inline(always)]
 pub(crate) fn axis_offset(q: f64, lo: f64, hi: f64) -> f64 {
     (lo - q).max(q - hi).max(0.0)
@@ -224,7 +223,6 @@ impl Boxes {
     }
 }
 
-/// A window of [`Boxes`] the build carves into disjoint per-subtree halves.
 pub(crate) struct BoxesMut<'a> {
     values: &'a mut [f64],
     ndim: usize,
