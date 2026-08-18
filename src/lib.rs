@@ -54,7 +54,6 @@ struct Points {
 fn as_points(obj: &Bound<'_, PyAny>, what: &'static str, allow_single: bool) -> PyResult<Points> {
     let readonly = as_f64_array(obj)?;
     let view = readonly.as_array();
-    let shape_err = || kd_error(KDTreeError::InvalidShape(what));
     match view.ndim() {
         1 if allow_single => Ok(Points {
             n_rows: 1,
@@ -68,7 +67,7 @@ fn as_points(obj: &Bound<'_, PyAny>, what: &'static str, allow_single: bool) -> 
             values: row_major(&view),
             single: false,
         }),
-        _ => Err(shape_err()),
+        _ => Err(kd_error(KDTreeError::InvalidShape(what))),
     }
 }
 

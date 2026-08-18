@@ -25,3 +25,12 @@ allocation-counter = "0.8.1"
 # workloads. The crate is small, so the build-time cost is a few seconds.
 [profile.release]
 codegen-units = 1
+
+# Inherits `codegen-units` from release; line tables are what callgrind needs
+# to attribute counts to source lines rather than to addresses.
+[profile.bench]
+debug = 1
+
+[[bench]]
+name = "grid"
+harness = false

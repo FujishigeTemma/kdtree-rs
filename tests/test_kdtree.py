@@ -95,9 +95,6 @@ def test_compatibility(problem: Problem) -> None:
     check_query(*problem)
 
 
-RNG = np.random.default_rng(0)
-PARALLEL_QUERIES = RNG.normal(size=(256, 8))
-
 VALID: dict[str, Case] = {
     "single-query": Case(
         np.array([[0.0, 0.0], [1.0, 0.0], [4.0, 0.0]]),
@@ -148,8 +145,8 @@ VALID: dict[str, Case] = {
         k=2,
     ),
     "large-parallel-batch": Case(
-        RNG.normal(size=(2_000, 8)),
-        PARALLEL_QUERIES,
+        np.random.default_rng(0).normal(size=(2_000, 8)),
+        np.random.default_rng(1).normal(size=(256, 8)),
         k=4,
         parallel=True,
     ),

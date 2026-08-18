@@ -36,32 +36,28 @@ def make_data(distribution: Distribution, n_points: int, dims: int) -> np.ndarra
     raise ValueError(distribution)
 
 
+# Builds are serial only — SciPy's KDTree cannot build in parallel, so there
+# would be nothing to compare against. The literal `-serial` suffix keeps the
+# ids aligned with `benches/grid.rs`.
 BUILD_PARAMS = [
     pytest.param(
         dims,
         n_points,
         "bimodal",
-        parallel,
-        id=f"build-d{dims}-n{n_points}-{'parallel' if parallel else 'serial'}",
+        id=f"build-d{dims}-n{n_points}-serial",
         marks=pytest.mark.benchmark(group=f"build-d{dims}-n{n_points}"),
     )
     for dims, n_points, _ in SIZES
-    for parallel in (False,)  # SciPy's KDTree doesn't support parallel building
 ] + [
     pytest.param(
         dims,
         n_points,
         distribution,
-        parallel,
-        id=(
-            f"build-unbalanced-d{dims}-n{n_points}-{distribution}"
-            f"-{'parallel' if parallel else 'serial'}"
-        ),
+        id=f"build-unbalanced-d{dims}-n{n_points}-{distribution}-serial",
         marks=pytest.mark.benchmark(group=f"build-unbalanced-d{dims}-n{n_points}-{distribution}"),
     )
     for dims, n_points, _ in SIZES
     for distribution in ("uniform", "sorted")
-    for parallel in (False,)  # SciPy's KDTree doesn't support parallel building
 ]
 
 QUERY_PARAMS = [
@@ -114,7 +110,7 @@ QUERY_PARAMS = [
 
 @pytest.mark.parametrize("implementation", IMPLEMENTATIONS)
 @pytest.mark.parametrize(
-    ("dims", "n_points", "distribution", "parallel"),
+    ("dims", "n_points", "distribution"),
     BUILD_PARAMS,
 )
 def test_build(
@@ -122,12 +118,11 @@ def test_build(
     dims: int,
     n_points: int,
     distribution: Distribution,
-    parallel: bool,
     implementation: Implementation,
 ) -> None:
     data = make_data(distribution, n_points, dims)
     if implementation == "kdtree":
-        benchmark(KDTree, data, leafsize=16, parallel=parallel)
+        benchmark(KDTree, data, leafsize=16)
     else:
         benchmark(SciPyKDTree, data, leafsize=16)
 

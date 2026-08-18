@@ -76,7 +76,6 @@ pub(crate) fn build(
         indices,
         nodes,
         boxes,
-        n_points,
         ndim,
         leafsize,
     })
@@ -164,7 +163,6 @@ fn split_point(len: usize) -> usize {
     len / 2
 }
 
-
 fn count_nodes(len: usize, leafsize: usize) -> usize {
     if len <= leafsize {
         1
@@ -248,20 +246,9 @@ fn build_subtree<W: Width>(l: &Layout, mut st: Subtree<'_, W>) {
 }
 
 fn shrank_off_axis(parent: BBox<'_>, child: BBox<'_>, split_dim: usize) -> bool {
-    let mut max_ratio = 0.0_f64;
-    for d in 0..parent.ndim() {
-        if d == split_dim {
-            continue;
-        }
-        let parent_extent = parent.extent(d);
-        let ratio = if parent_extent > 0.0 {
-            child.extent(d) / parent_extent
-        } else {
-            1.0
-        };
-        max_ratio = max_ratio.max(ratio);
-    }
-    max_ratio < BOX_ORDER_MAX_SHRINK_RATIO
+    (0..parent.ndim())
+        .filter(|&d| d != split_dim)
+        .all(|d| child.extent(d) < BOX_ORDER_MAX_SHRINK_RATIO * parent.extent(d))
 }
 
 /// Move rows so everything before `mid` has key `<= pivot` and everything from
@@ -328,7 +315,7 @@ fn partition_rows<W: Width>(
 
 #[cfg(test)]
 mod tests {
-    use crate::tree::{Node, Tree};
+    use crate::tree::Tree;
 
     #[test]
     fn build_rejects_empty_inputs() {
@@ -367,37 +354,7 @@ mod tests {
 
         assert_eq!(serial.data, parallel.data);
         assert_eq!(serial.indices, parallel.indices);
-        assert_eq!(serial.nodes.len(), parallel.nodes.len());
-        for id in 0..serial.nodes.len() as u32 {
-            let (a, b) = (serial.box_of(id), parallel.box_of(id));
-            assert_eq!(a.lo, b.lo);
-            assert_eq!(a.hi, b.hi);
-            match (serial.node(id), parallel.node(id)) {
-                (
-                    Node::Leaf { start: s0, end: e0 },
-                    Node::Leaf {
-                        start: s1,
-                        end: e1,
-                    },
-                ) => assert_eq!((s0, e0), (s1, e1)),
-                (
-                    Node::Inner {
-                        left: l0,
-                        right: r0,
-                        split_dim: d0,
-                        order_by_box: o0,
-                        split_value: v0,
-                    },
-                    Node::Inner {
-                        left: l1,
-                        right: r1,
-                        split_dim: d1,
-                        order_by_box: o1,
-                        split_value: v1,
-                    },
-                ) => assert_eq!((l0, r0, d0, o0, v0), (l1, r1, d1, o1, v1)),
-                _ => panic!("node {id} differs in kind"),
-            }
-        }
+        assert_eq!(serial.nodes, parallel.nodes);
+        assert!(serial.boxes == parallel.boxes, "boxes differ");
     }
 }

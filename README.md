@@ -32,7 +32,12 @@ distances, indices = tree.query(np.array([[0.2, 0.0], [2.8, 0.0]]), k=2)
 ```bash
 uv run pytest                     # property-based tests (vs SciPy as oracle)
 uv run pytest tests/benchmark.py  # benchmarks (vs SciPy)
+cargo bench --bench grid          # the same workload grid without Python
 ```
+
+`benches/grid.rs` mirrors `tests/benchmark.py`'s workloads and ids, so a profile
+lines up with a benchmark case. Profiling and the counter-based A/B protocol are
+Linux-only and documented in `BENCHMARK.md`.
 
 The distance kernels use portable SIMD (`std::simd`), which is not stabilized
 yet, so the crate builds on the nightly toolchain pinned in

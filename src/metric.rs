@@ -1,22 +1,24 @@
 use crate::error::KDTreeError;
 
-/// A distance in the reduced (monotone-image) domain of some [`Metric`]:
-/// squared for `L2`, the p-th power for `L^p`, the plain value elsewhere. Every
-/// comparison and accumulation in the crate stays here, so the root is taken once
-/// per emitted result rather than once per candidate. Only meaningfully ordered
+/// A distance as the crate's core handles it. Its representation belongs to the
+/// producing [`Metric`] — squared for `L2`, the p-th power for `L^p`, the plain
+/// value elsewhere — a monotone image, so every comparison and accumulation
+/// stays in it and the root is taken once per emitted result rather than once
+/// per candidate. Raw `f64` distances exist only at the API boundary, crossing
+/// through [`Metric::reduce`] / [`Metric::restore`]. Only meaningfully ordered
 /// against values of the same metric.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 #[repr(transparent)]
-pub(crate) struct Rd(f64);
+pub(crate) struct Dist(f64);
 
-impl Rd {
+impl Dist {
     pub(crate) const ZERO: Self = Self(0.0);
     pub(crate) const INFINITY: Self = Self(f64::INFINITY);
 
-    /// Re-enter the domain with a value already in it — for kernels that fold
-    /// raw SIMD lanes. Named so every such site is greppable.
+    /// Wrap a value already in the metric's representation — for kernels that
+    /// fold raw SIMD lanes. Named so every such site is greppable.
     #[inline(always)]
-    pub(crate) const fn reduced(value: f64) -> Self {
+    pub(crate) const fn from_repr(value: f64) -> Self {
         Self(value)
     }
 
@@ -29,15 +31,9 @@ impl Rd {
     pub(crate) fn min(self, other: Self) -> Self {
         Self(self.0.min(other.0))
     }
-
-    /// Scale by a factor that is itself already reduced ([`Metric::eps_factor`]).
-    #[inline(always)]
-    pub(crate) fn scaled(self, factor: f64) -> Self {
-        Self(self.0 * factor)
-    }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Metric {
     L1,
     L2,
@@ -65,9 +61,9 @@ impl Metric {
     /// Takes a whole distance or a single axis offset — one axis reduces exactly
     /// like a whole distance.
     #[inline]
-    pub(crate) fn reduce(self, distance: f64) -> Rd {
+    pub(crate) fn reduce(self, distance: f64) -> Dist {
         debug_assert!(distance >= 0.0);
-        Rd(match self {
+        Dist(match self {
             Self::L2 => distance * distance,
             Self::LP(p) => distance.powf(p),
             Self::L1 | Self::LInf => distance,
@@ -75,34 +71,29 @@ impl Metric {
     }
 
     #[inline]
-    pub(crate) fn restore(self, rd: Rd) -> f64 {
+    pub(crate) fn restore(self, dist: Dist) -> f64 {
         match self {
-            Self::L2 => rd.0.sqrt(),
-            Self::LP(p) => rd.0.powf(1.0 / p),
-            Self::L1 | Self::LInf => rd.0,
+            Self::L2 => dist.0.sqrt(),
+            Self::LP(p) => dist.0.powf(1.0 / p),
+            Self::L1 | Self::LInf => dist.0,
         }
     }
 
     #[inline]
-    pub(crate) fn eps_factor(self, eps: f64) -> f64 {
-        self.reduce(1.0 + eps).0
-    }
-
-    #[inline]
-    pub(crate) fn fold(self, rd: Rd, axis: Rd) -> Rd {
-        Rd(match self {
-            Self::LInf => rd.0.max(axis.0),
-            _ => rd.0 + axis.0,
+    pub(crate) fn fold(self, dist: Dist, axis: Dist) -> Dist {
+        Dist(match self {
+            Self::LInf => dist.0.max(axis.0),
+            _ => dist.0 + axis.0,
         })
     }
 
     /// Requires `new >= old`, which holds whenever a descent moves from a parent
     /// cell into the far child along the split.
     #[inline]
-    pub(crate) fn replace_axis(self, rd: Rd, old: Rd, new: Rd) -> Rd {
-        Rd(match self {
-            Self::LInf => rd.0.max(new.0),
-            _ => rd.0 - old.0 + new.0,
+    pub(crate) fn replace_axis(self, dist: Dist, old: Dist, new: Dist) -> Dist {
+        Dist(match self {
+            Self::LInf => dist.0.max(new.0),
+            _ => dist.0 - old.0 + new.0,
         })
     }
 }

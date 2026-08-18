@@ -8,7 +8,7 @@ use crate::layout::{BBox, Boxes, Dyn, Rows};
 
 pub(crate) const ROOT: u32 = 0;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Node {
     Leaf {
         start: u32,
@@ -31,7 +31,6 @@ pub struct Tree {
     pub(crate) indices: Vec<u32>,
     pub(crate) nodes: Vec<Node>,
     pub(crate) boxes: Boxes,
-    pub(crate) n_points: usize,
     pub(crate) ndim: usize,
     pub(crate) leafsize: usize,
 }
@@ -51,7 +50,7 @@ impl Tree {
     }
 
     pub fn n_points(&self) -> usize {
-        self.n_points
+        self.data.len() / self.ndim
     }
 
     pub fn leafsize(&self) -> usize {
@@ -59,7 +58,7 @@ impl Tree {
     }
 
     pub fn original_data(&self) -> Vec<f64> {
-        let mut original = vec![0.0_f64; self.n_points * self.ndim];
+        let mut original = vec![0.0_f64; self.data.len()];
         for (pos, &original_idx) in self.indices.iter().enumerate() {
             let src = pos * self.ndim;
             let dst = original_idx as usize * self.ndim;
@@ -80,7 +79,7 @@ impl Tree {
 
     #[inline(always)]
     pub(crate) fn root_box(&self) -> BBox<'_> {
-        self.boxes.of(ROOT)
+        self.box_of(ROOT)
     }
 
     #[inline(always)]

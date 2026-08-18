@@ -86,7 +86,7 @@ Date: 2026-08-14
 29. **`cell`（軸ごとの寄与）の save/restore プロトコル**。far child に降りる直前に
     1 スロットだけ書き換え、戻ったら復元する。
 30. **クエリ間の全ゼロ不変**。クエリが root box の内側なら `cell` はゼロのままで
-    正しいので、`box_rd == 0.0` を fast path にして seed 自体を飛ばす。
+    正しいので、`box_dist == 0.0` を fast path にして seed 自体を飛ばす。
     外側のクエリだけが埋めて、降下後にゼロへ戻す。
 31. **`Best1` / `BestK` の monomorphize**。`k == 1` はヒープを持たず 2 レジスタ。
 32. **`order_by_box` node は box 距離で子を順序付ける**。両方の子を box で gate し、
@@ -139,7 +139,7 @@ Date: 2026-08-14
 | `simd_max` / `reduce_sum` を使う | maxNum の fixup / 直列リダクション |
 | bound チェックを軸ごと or 行ごとにする | どちらも遅い |
 | `descend_by_box` を inline させる | フラットデータの hot path が太る |
-| `point_rd` を `#[inline]` のままにする | d16 の葉走査で **12% 遅い**（下記） |
+| `point_dist` を `#[inline]` のままにする | d16 の葉走査で **12% 遅い**（下記） |
 
 ### 抽象が性能を落とす 3 つの経路（実測で全部踏んだ）
 
@@ -151,7 +151,7 @@ Date: 2026-08-14
    `self.width` のロードが毎反復入る。**`RowsMut` を値渡しにする**と SROA が効いて
    幅がレジスタに載る（build d5 で 12.5% 差）。
 2. **走査の bound を構造体フィールドに持つと、点ごとのロードになる。**
-   `Scan` に `bound: Rd` を置くと `&mut self` 越しの読み出しが毎点入る。
+   `Scan` に `bound: Dist` を置くと `&mut self` 越しの読み出しが毎点入る。
    **bound は「単調に締まっていく値」として引数と戻り値で流す**のが正しい
    （型としても正直で、レジスタにも載る）。
 3. **`#[inline(always)]` を付けないと、hot path が関数呼び出しに戻る。**（下記）
@@ -163,7 +163,7 @@ Date: 2026-08-14
 
 `codegen-units = 1` は crate 全体を 1 つの翻訳単位にするので、LLVM の inline
 ヒューリスティックは**クレート全体のコードサイズに依存する**。リファクタで型と
-メソッドを増やしただけで、それまで inline されていた `kernel::point_rd` が
+メソッドを増やしただけで、それまで inline されていた `kernel::point_dist` が
 アウトオブライン関数として残るようになり、d16（wide-row = `streamed` 経路）の
 葉走査が 12% 遅くなった。d8 以下（packed 経路）は無関係なので、
 「d16 だけ遅い」という分かりにくい形で出る。
@@ -171,7 +171,7 @@ Date: 2026-08-14
 診断は `nm` でシンボルが残っているかを見るのが速い:
 
 ```bash
-nm target/release/libkdtree.dylib | grep point_rd   # 出たら inline されていない
+nm target/release/libkdtree.dylib | grep point_dist   # 出たら inline されていない
 ```
 
 **教訓**: `codegen-units = 1` を使う以上、hot path の inline は
@@ -200,16 +200,16 @@ nm target/release/libkdtree.dylib | grep point_rd   # 出たら inline されて
 
 つまり **抽象の穴が 6 個**ある。設計はこの 6 個を埋めるだけでよく、それ以上は要らない。
 
-## 1. 型: `Rd` — reduced distance
+## 1. 型: `Dist` — reduced-distance 表現を持つ距離
 
 ```rust
 /// 単調像としての距離。生成と復元は `Metric` だけが行う。
 #[derive(Clone, Copy, PartialEq, PartialOrd)]
-pub struct Rd(f64);
+pub struct Dist(f64);
 ```
 
 - 構築子は `Metric::reduce` / kernel の内部だけ。復元は `Metric::restore` だけ。
-- `Rd` 同士の `min` / 比較 / `eps` 倍は許す。true distance との混同はコンパイルエラー。
+- `Dist` 同士の `min` / 比較 / `eps` 倍は許す。true distance との混同はコンパイルエラー。
 - **削除されるもの**: `metric.rs` / `query.rs` / `kernel.rs` 冒頭の「この値は reduced だ」
   という宣言コメント群と、それを人間が追う必要そのもの。
 - ランタイムコストはゼロ（`repr(transparent)`）。
@@ -237,7 +237,7 @@ metric も作らないが型の上では存在する）になる。負の計測�
 
 したがって `Metric` は 4 variant の enum のまま残す。実際に入れた変更は:
 
-- `Rd` newtype の導入（第 1 の穴）
+- `Dist` newtype の導入（第 1 の穴）
 - `axis_rd` の削除（`reduce` と同一実装の別名だった）
 
 分解を再検討するなら、ランタイム enum ではなく**型レベル化**（ZST の型引数）で
@@ -281,7 +281,7 @@ struct Boxes { values: Vec<f64>, ndim: usize }   // Boxes::of(id) -> BBox<'_>
 
 - **削除されるもの**: `split_box` / `split_box_mut` / `Tree::box_of` / `Tree::root_box` と、
   `2 * ndim * id` のアドレス計算 5 箇所、`(lo, hi)` タプルの引き回し。
-- `Metric::box_rd(q, bbox) -> Rd`、`Rows::bbox_into(BBoxMut)`、
+- `Metric::box_dist(q, bbox) -> Dist`、`Rows::bbox_into(BBoxMut)`、
   `shrank_off_axis(parent: BBox, child: BBox, ..)` が全部素直に書ける。
 
 ## 5. 抽象: `Sink` — 葉走査の受け側
@@ -291,8 +291,8 @@ struct Boxes { values: Vec<f64>, ndim: usize }   // Boxes::of(id) -> BBox<'_>
 
 ```rust
 trait Sink {
-    fn bound(&self) -> Rd;                 // 現在の枝刈り境界
-    fn offer(&mut self, offset: usize, rd: Rd);
+    fn bound(&self) -> Dist;                 // 現在の枝刈り境界
+    fn offer(&mut self, offset: usize, dist: Dist);
 }
 ```
 
@@ -323,7 +323,7 @@ trait Sink {
 
 `Descent<K: Strategy>` として呼び出しごとに解決すると、葉ごとの分岐が消えるだけ
 でなく、**各 descent の機械語がその 1 戦略ぶんだけになる**。9 戦略を全部 1 個の
-`descend` に inline すると、d3 のクエリは絶対に通らない `Streamed`（`point_rd` の
+`descend` に inline すると、d3 のクエリは絶対に通らない `Streamed`（`point_dist` の
 SIMD 3 アームを含み、最大）のぶんまで I-cache を負担する。逆に `Streamed` だけを
 関数外に出すと今度は d16 が損をする。どちらか一方を選ぶ問題ではなく、
 **分割の粒度が間違っている**というのが正解だった。
@@ -346,28 +346,28 @@ SIMD 3 アームを含み、最大）のぶんまで I-cache を負担する。�
 ## 7. 型: `CellBound` — 分割平面下界のスタック規律
 
 ```rust
-struct CellBound { axes: Vec<Rd>, seeded: bool }
+struct CellBound { axes: Vec<Dist>, seeded: bool }
 impl CellBound {
-    fn start(&mut self, m: Metric, q: &[f64], root: BBox) -> Rd;  // 内側なら 0 で即返す
+    fn start(&mut self, m: Metric, q: &[f64], root: BBox) -> Dist;  // 内側なら 0 で即返す
     fn finish(&mut self);                                          // seeded のときだけゼロ戻し
-    fn axis(&self, dim: usize) -> Rd;
-    #[must_use] fn swap_axis(&mut self, dim: usize, axis: Rd) -> Rd;
+    fn axis(&self, dim: usize) -> Dist;
+    #[must_use] fn swap_axis(&mut self, dim: usize, axis: Dist) -> Dist;
 }
 ```
 
 - 「クエリ間で全ゼロ」という不変条件が 1 つの型に閉じる（今は
   `Scratch::cell` のコメント、`Descent::run`、`seed_cell`、`enter_far` の 4 箇所）。
 - fast path（root box の内側）は `start` の内部実装になり、`run` から分岐が消える。
-- **畳み込み後の合計 `cell_rd` は再帰引数のまま残す**。これは
+- **畳み込み後の合計 `cell_dist` は再帰引数のまま残す**。これは
   「このフレームのノードの下界」というフレームローカルな値で、`Scratch` の
   メモリに置くと再帰呼び出し後にリロードが出る（工夫 34 と同じ理由）。
 
 ### 破ってはいけない不変条件
 
-> **box 距離は gate にしか使わない。分割平面下界の代数（`cell` と `cell_rd`）には
+> **box 距離は gate にしか使わない。分割平面下界の代数（`cell` と `cell_dist`）には
 > 絶対に混ぜない。**
 
-`descend_by_box` で近い方の子に降りるとき、渡すのは親の `cell_rd` であって
+`descend_by_box` で近い方の子に降りるとき、渡すのは親の `cell_dist` であって
 `near_box` ではない。ここを「2 つの下界を 1 個の引数に統一する」と綺麗に見えるが、
 枝刈りが壊れる（`cell` との整合が崩れて以降の `replace_axis` が嘘になる）。
 
@@ -394,10 +394,10 @@ struct Tree { rows: Vec<f64>, ndim: usize, indices: Vec<u32>, nodes: Vec<Node>, 
 抽象が正しく取れていればファイル分割は自明に決まる（そして、それ自体は本質ではない）。
 
 ```
-metric.rs   Rd, Metric                            距離の代数
+metric.rs   Dist, Metric                            距離の代数
 layout.rs   Width, Rows, RowsMut, BBox, Boxes     レイアウトの語彙
 simd.rs     LANES, F64s, vmin/vmax/hsum/hmax      SIMD プリミティブ
-kernel.rs   bbox, point_rd, box_rd, Sink, Scan    バルクループ
+kernel.rs   bbox, point_dist, box_dist, Sink, Scan    バルクループ
 tree.rs     Node, Tree                            記憶レイアウト
 build.rs    Subtree の切り出しと再帰              唯一の writer
 query.rs    CellBound, Descent, Best              分枝限定
@@ -409,7 +409,7 @@ lib.rs      PyO3 境界
 一括書き換えはしない。負の計測結果が多すぎるので、一度に変えると
 「どれが遅くした変更か」の信号が消える。
 
-**Stage A** — `Rd` + `Width` / `Rows` / `BBox` / `Boxes`。型と語彙だけ。
+**Stage A** — `Dist` + `Width` / `Rows` / `BBox` / `Boxes`。型と語彙だけ。
 `const D` と `(data, ndim)` を一掃する。
 
 **Stage B** — `Sink` + `Scan` の 3 戦略。kernel の再構成。

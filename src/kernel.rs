@@ -16,7 +16,7 @@ use std::simd::prelude::*;
 use std::simd::simd_swizzle;
 
 use crate::layout::{BBox, BBoxMut, Rows, Width, axis_offset};
-use crate::metric::{Metric, Rd};
+use crate::metric::{Dist, Metric};
 use crate::simd::{F64s, LANES, hmax, hsum, nonfinite_lanes, vmax, vmin};
 
 #[inline(always)]
@@ -38,30 +38,30 @@ fn combine<const N: usize>(m: Metric, a: Simd<f64, N>, b: Simd<f64, N>) -> Simd<
 
 /// The match stays outside the loop so LLVM can unroll or vectorize each arm.
 #[inline(always)]
-fn fold_scalar(m: Metric, mut rd: f64, lhs: &[f64], rhs: &[f64]) -> f64 {
+fn fold_scalar(m: Metric, mut dist: f64, lhs: &[f64], rhs: &[f64]) -> f64 {
     match m {
         Metric::L1 => {
             for (a, b) in lhs.iter().zip(rhs) {
-                rd += (a - b).abs();
+                dist += (a - b).abs();
             }
         }
         Metric::L2 => {
             for (a, b) in lhs.iter().zip(rhs) {
                 let delta = a - b;
-                rd += delta * delta;
+                dist += delta * delta;
             }
         }
         Metric::LInf => {
             for (a, b) in lhs.iter().zip(rhs) {
                 let delta = (a - b).abs();
-                if delta > rd {
-                    rd = delta;
+                if delta > dist {
+                    dist = delta;
                 }
             }
         }
-        Metric::LP(_) => unreachable!("LP folds only in point_rd_lp"),
+        Metric::LP(_) => unreachable!("LP folds only in point_dist_lp"),
     }
-    rd
+    dist
 }
 
 pub(crate) fn all_finite(values: &[f64]) -> bool {
@@ -163,31 +163,31 @@ fn gcd(mut a: usize, mut b: usize) -> usize {
 /// `inline(always)`, not `inline`: with `codegen-units = 1` the size heuristic
 /// depends on the whole crate, so growing anything anywhere can demote this to a
 /// real call per point — 12% on d16 leaf scans when it happened. `nm | grep
-/// point_rd` finding a symbol means it has.
+/// point_dist` finding a symbol means it has.
 #[inline(always)]
-fn point_rd(m: Metric, lhs: &[f64], rhs: &[f64], bound: Rd) -> Rd {
+fn point_dist(m: Metric, lhs: &[f64], rhs: &[f64], bound: Dist) -> Dist {
     let bound = bound.get();
-    Rd::reduced(match m {
-        Metric::L1 | Metric::L2 => point_rd_sum(m, lhs, rhs, bound),
-        Metric::LInf => point_rd_linf(lhs, rhs, bound),
-        Metric::LP(p) => point_rd_lp(p, lhs, rhs, bound),
+    Dist::from_repr(match m {
+        Metric::L1 | Metric::L2 => point_dist_sum(m, lhs, rhs, bound),
+        Metric::LInf => point_dist_linf(lhs, rhs, bound),
+        Metric::LP(p) => point_dist_lp(p, lhs, rhs, bound),
     })
 }
 
-fn point_rd_sum(m: Metric, lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
+fn point_dist_sum(m: Metric, lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
     let (l_chunks, l_rest) = lhs.as_chunks::<LANES>();
     let (r_chunks, r_rest) = rhs.as_chunks::<LANES>();
-    let mut rd = 0.0_f64;
+    let mut dist = 0.0_f64;
     for (l, r) in l_chunks.iter().zip(r_chunks) {
-        rd += hsum(axes_lanes(m, F64s::from_array(*l) - F64s::from_array(*r)));
-        if rd > bound {
-            return rd;
+        dist += hsum(axes_lanes(m, F64s::from_array(*l) - F64s::from_array(*r)));
+        if dist > bound {
+            return dist;
         }
     }
-    fold_scalar(m, rd, l_rest, r_rest)
+    fold_scalar(m, dist, l_rest, r_rest)
 }
 
-fn point_rd_linf(lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
+fn point_dist_linf(lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
     let (l_chunks, l_rest) = lhs.as_chunks::<LANES>();
     let (r_chunks, r_rest) = rhs.as_chunks::<LANES>();
     if l_chunks.is_empty() {
@@ -204,24 +204,24 @@ fn point_rd_linf(lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
     fold_scalar(Metric::LInf, hmax(vm), l_rest, r_rest)
 }
 
-fn point_rd_lp(p: f64, lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
-    let mut rd = 0.0_f64;
+fn point_dist_lp(p: f64, lhs: &[f64], rhs: &[f64], bound: f64) -> f64 {
+    let mut dist = 0.0_f64;
     for (l, r) in lhs.chunks(LANES).zip(rhs.chunks(LANES)) {
         for (a, b) in l.iter().zip(r) {
-            rd += (a - b).abs().powf(p);
+            dist += (a - b).abs().powf(p);
         }
-        if rd > bound {
-            return rd;
+        if dist > bound {
+            return dist;
         }
     }
-    rd
+    dist
 }
 
 /// `bound` is called once per scan plus once per accepted candidate, never per
 /// point — [`Scan`] threads the value through its loops to keep it that way.
 pub(crate) trait Sink {
-    fn bound(&self) -> Rd;
-    fn offer(&mut self, offset: usize, rd: Rd);
+    fn bound(&self) -> Dist;
+    fn offer(&mut self, offset: usize, dist: Dist);
 }
 
 /// Resolved once per `query` call so each descent carries only the strategy it
@@ -232,42 +232,51 @@ pub(crate) trait Strategy {
     fn scan<S: Sink>(m: Metric, q: &[f64], block: Rows<'_>, sink: &mut S);
 }
 
-const MAX_PACKED_WIDTH: usize = LANES;
+pub(crate) const MAX_PACKED_WIDTH: usize = LANES;
 
 /// Two chunks is where the benchmark grid stops, so the threshold sits at the
 /// edge of what is measured rather than at a guess about wider rows.
-const MAX_FOLDED_WIDTH: usize = 2 * LANES;
+pub(crate) const MAX_FOLDED_WIDTH: usize = 2 * LANES;
 
-pub(crate) enum Plan {
-    Packed,
-    FoldedAbs,
-    FoldedSquared,
-    Streamed,
+/// Resolves `(metric, ndim)` to a [`Strategy`] type and substitutes it into
+/// `$body`. Each strategy is named here exactly once, so the plan cannot pair
+/// with the wrong kernel — there is no enum round-trip to keep in sync.
+macro_rules! with_plan {
+    ($m:expr, $ndim:expr, |$S:ident| $body:expr) => {{
+        use $crate::kernel::{Abs, Folded, Packed, Squared, Streamed};
+        use $crate::metric::Metric;
+        match ($m, $ndim) {
+            (Metric::L1 | Metric::L2 | Metric::LInf, d)
+                if d <= $crate::kernel::MAX_PACKED_WIDTH =>
+            {
+                type $S = Packed;
+                $body
+            }
+            (Metric::L1, d) if d <= $crate::kernel::MAX_FOLDED_WIDTH => {
+                type $S = Folded<Abs>;
+                $body
+            }
+            (Metric::L2, d) if d <= $crate::kernel::MAX_FOLDED_WIDTH => {
+                type $S = Folded<Squared>;
+                $body
+            }
+            _ => {
+                type $S = Streamed;
+                $body
+            }
+        }
+    }};
 }
+pub(crate) use with_plan;
 
-pub(crate) fn plan(m: Metric, ndim: usize) -> Plan {
-    match m {
-        Metric::L1 | Metric::L2 | Metric::LInf if ndim <= MAX_PACKED_WIDTH => Plan::Packed,
-        Metric::L1 if ndim <= MAX_FOLDED_WIDTH => Plan::FoldedAbs,
-        Metric::L2 if ndim <= MAX_FOLDED_WIDTH => Plan::FoldedSquared,
-        _ => Plan::Streamed,
-    }
-}
-
-/// Rows short enough that [`point_rd`]'s early exit would save nothing: pack
+/// Rows short enough that [`point_dist`]'s early exit would save nothing: pack
 /// several points per step and leave the SIMD domain only for the rare in-bound
 /// candidates.
 pub(crate) struct Packed;
 
 impl Strategy for Packed {
     fn scan<S: Sink>(m: Metric, q: &[f64], block: Rows<'_>, sink: &mut S) {
-        let bound = sink.bound();
-        let mut scan = Scan {
-            m,
-            q,
-            flat: block.flat(),
-            sink,
-        };
+        let (mut scan, bound) = Scan::new(m, q, block, sink);
         match block.ndim() {
             1 => scan.unrolled::<1>(bound),
             2 => scan.d2(bound),
@@ -277,7 +286,7 @@ impl Strategy for Packed {
             6 => scan.unrolled::<6>(bound),
             7 => scan.unrolled::<7>(bound),
             8 => scan.d8(bound),
-            _ => unreachable!("`packs` routes wider rows to `Streamed`"),
+            _ => unreachable!("`plan` routes wider rows to `Streamed`"),
         };
     }
 }
@@ -288,14 +297,8 @@ pub(crate) struct Streamed;
 
 impl Strategy for Streamed {
     fn scan<S: Sink>(m: Metric, q: &[f64], block: Rows<'_>, sink: &mut S) {
-        let bound = sink.bound();
-        Scan {
-            m,
-            q,
-            flat: block.flat(),
-            sink,
-        }
-        .streamed(bound);
+        let (mut scan, bound) = Scan::new(m, q, block, sink);
+        scan.streamed(bound);
     }
 }
 
@@ -308,42 +311,46 @@ impl Strategy for Streamed {
 /// extend [`MAX_FOLDED_WIDTH`] and that balance tips back.
 ///
 /// Every loop that reaches a leaf has to stay monomorphic, hence the const axis
-/// reduction and a separate strategy: adding an `L1` arm to [`point_rd`] cost the
+/// reduction and a separate strategy: adding an `L1` arm to [`point_dist`] cost the
 /// *`L2`* d16 scans 12-14% on aarch64, reproducibly across three spellings, and
 /// padding the baseline with unrelated code moved it only 3%.
-pub(crate) struct Folded<const SQUARED: bool>;
+pub(crate) struct Folded<F>(std::marker::PhantomData<F>);
 
-impl<const SQUARED: bool> Strategy for Folded<SQUARED> {
+/// The metric as a type: `F::METRIC` is a constant, so the matches inside
+/// [`axes_lanes`] and [`fold_scalar`] vanish under [`Folded`].
+pub(crate) trait Fold {
+    const METRIC: Metric;
+}
+
+pub(crate) struct Abs;
+impl Fold for Abs {
+    const METRIC: Metric = Metric::L1;
+}
+
+pub(crate) struct Squared;
+impl Fold for Squared {
+    const METRIC: Metric = Metric::L2;
+}
+
+impl<F: Fold> Strategy for Folded<F> {
     fn scan<S: Sink>(m: Metric, q: &[f64], block: Rows<'_>, sink: &mut S) {
-        debug_assert!(match m {
-            Metric::L1 => !SQUARED,
-            Metric::L2 => SQUARED,
-            _ => false,
-        });
-        let bound = sink.bound();
-        Scan {
-            m,
-            q,
-            flat: block.flat(),
-            sink,
-        }
-        .folded::<SQUARED>(bound);
+        debug_assert!(m == F::METRIC);
+        let (mut scan, bound) = Scan::new(m, q, block, sink);
+        scan.folded::<F>(bound);
     }
 }
 
-/// `SQUARED` picks the axis reduction at compile time, so the `Metric` handed to
-/// [`axes_lanes`] and [`fold_scalar`] is a constant and both matches vanish.
 #[inline(always)]
-fn point_rd_folded<const SQUARED: bool>(lhs: &[f64], rhs: &[f64]) -> f64 {
-    let m = if SQUARED { Metric::L2 } else { Metric::L1 };
+fn point_dist_folded<F: Fold>(lhs: &[f64], rhs: &[f64]) -> f64 {
+    let m = F::METRIC;
     let (l_chunks, l_rest) = lhs.as_chunks::<LANES>();
     let (r_chunks, r_rest) = rhs.as_chunks::<LANES>();
     let mut acc = F64s::splat(0.0);
     for (l, r) in l_chunks.iter().zip(r_chunks) {
         acc += axes_lanes(m, F64s::from_array(*l) - F64s::from_array(*r));
     }
-    let rd = if l_chunks.is_empty() { 0.0 } else { hsum(acc) };
-    fold_scalar(m, rd, l_rest, r_rest)
+    let dist = if l_chunks.is_empty() { 0.0 } else { hsum(acc) };
+    fold_scalar(m, dist, l_rest, r_rest)
 }
 
 /// The pruning bound is deliberately not a field: it flows through every method
@@ -356,32 +363,46 @@ struct Scan<'a, S: Sink> {
     sink: &'a mut S,
 }
 
-impl<S: Sink> Scan<'_, S> {
+impl<'a, S: Sink> Scan<'a, S> {
+    /// This and [`Scan::offer`] are the only two [`Sink::bound`] calls — the
+    /// discipline DESIGN.md §5 checks mechanically with a grep.
     #[inline(always)]
-    fn offer(&mut self, offset: usize, rd: Rd) -> Rd {
-        self.sink.offer(offset, rd);
+    fn new(m: Metric, q: &'a [f64], block: Rows<'a>, sink: &'a mut S) -> (Self, Dist) {
+        let bound = sink.bound();
+        let scan = Self {
+            m,
+            q,
+            flat: block.flat(),
+            sink,
+        };
+        (scan, bound)
+    }
+
+    #[inline(always)]
+    fn offer(&mut self, offset: usize, dist: Dist) -> Dist {
+        self.sink.offer(offset, dist);
         self.sink.bound()
     }
 
     #[inline(always)]
-    fn folded<const SQUARED: bool>(&mut self, mut bound: Rd) -> Rd {
+    fn folded<F: Fold>(&mut self, mut bound: Dist) -> Dist {
         let (q, flat) = (self.q, self.flat);
         for (j, coords) in flat.chunks_exact(q.len()).enumerate() {
-            let rd = Rd::reduced(point_rd_folded::<SQUARED>(q, coords));
-            if rd <= bound {
-                bound = self.offer(j, rd);
+            let dist = Dist::from_repr(point_dist_folded::<F>(q, coords));
+            if dist <= bound {
+                bound = self.offer(j, dist);
             }
         }
         bound
     }
 
     #[inline(always)]
-    fn streamed(&mut self, mut bound: Rd) -> Rd {
+    fn streamed(&mut self, mut bound: Dist) -> Dist {
         let (m, q, flat) = (self.m, self.q, self.flat);
         for (j, coords) in flat.chunks_exact(q.len()).enumerate() {
-            let rd = point_rd(m, q, coords, bound);
-            if rd <= bound {
-                bound = self.offer(j, rd);
+            let dist = point_dist(m, q, coords, bound);
+            if dist <= bound {
+                bound = self.offer(j, dist);
             }
         }
         bound
@@ -390,19 +411,24 @@ impl<S: Sink> Scan<'_, S> {
     /// A compile-time width unrolls the axis loop, and with no early exit LLVM
     /// vectorizes across points.
     #[inline(always)]
-    fn unrolled<const D: usize>(&mut self, bound: Rd) -> Rd {
+    fn unrolled<const D: usize>(&mut self, bound: Dist) -> Dist {
         let flat = self.flat;
         self.unrolled_from::<D>(flat, 0, bound)
     }
 
     #[inline(always)]
-    fn unrolled_from<const D: usize>(&mut self, rows: &[f64], base: usize, mut bound: Rd) -> Rd {
+    fn unrolled_from<const D: usize>(
+        &mut self,
+        rows: &[f64],
+        base: usize,
+        mut bound: Dist,
+    ) -> Dist {
         let (m, q) = (self.m, self.q);
         let q = q.first_chunk::<D>().expect("row width exceeds query");
         for (j, p) in rows.as_chunks::<D>().0.iter().enumerate() {
-            let rd = Rd::reduced(fold_scalar(m, 0.0, q, p));
-            if rd <= bound {
-                bound = self.offer(base + j, rd);
+            let dist = Dist::from_repr(fold_scalar(m, 0.0, q, p));
+            if dist <= bound {
+                bound = self.offer(base + j, dist);
             }
         }
         bound
@@ -414,16 +440,16 @@ impl<S: Sink> Scan<'_, S> {
     #[inline(always)]
     fn packed<const CHUNK: usize, const P: usize, const D: usize>(
         &mut self,
-        mut bound: Rd,
-        rds_of: impl Fn(&[f64; CHUNK]) -> Simd<f64, P>,
-    ) -> Rd {
+        mut bound: Dist,
+        dists_of: impl Fn(&[f64; CHUNK]) -> Simd<f64, P>,
+    ) -> Dist {
         debug_assert_eq!(CHUNK, P * D);
         let (chunks, rest) = self.flat.as_chunks::<CHUNK>();
         let mut bound_v = Simd::splat(bound.get());
         for (i, c) in chunks.iter().enumerate() {
-            let rds = rds_of(c);
-            if rds.simd_le(bound_v).any() {
-                bound = self.emit(rds, i * P, bound);
+            let dists = dists_of(c);
+            if dists.simd_le(bound_v).any() {
+                bound = self.emit(dists, i * P, bound);
                 bound_v = Simd::splat(bound.get());
             }
         }
@@ -431,11 +457,11 @@ impl<S: Sink> Scan<'_, S> {
     }
 
     #[inline(always)]
-    fn emit<const N: usize>(&mut self, rds: Simd<f64, N>, base: usize, mut bound: Rd) -> Rd {
-        for (j, &rd) in rds.as_array().iter().enumerate() {
-            let rd = Rd::reduced(rd);
-            if rd <= bound {
-                bound = self.offer(base + j, rd);
+    fn emit<const N: usize>(&mut self, dists: Simd<f64, N>, base: usize, mut bound: Dist) -> Dist {
+        for (j, &dist) in dists.as_array().iter().enumerate() {
+            let dist = Dist::from_repr(dist);
+            if dist <= bound {
+                bound = self.offer(base + j, dist);
             }
         }
         bound
@@ -443,7 +469,7 @@ impl<S: Sink> Scan<'_, S> {
 
     /// Four 2-d points per register: `[x0 y0 x1 y1 x2 y2 x3 y3]`.
     #[inline(always)]
-    fn d2(&mut self, bound: Rd) -> Rd {
+    fn d2(&mut self, bound: Dist) -> Dist {
         let (m, q) = (self.m, self.q);
         let pattern = F64s::from_array([q[0], q[1], q[0], q[1], q[0], q[1], q[0], q[1]]);
         self.packed::<LANES, 4, 2>(bound, |c| {
@@ -458,7 +484,7 @@ impl<S: Sink> Scan<'_, S> {
     /// `[p0.xyz p1.xyz .. p7.xyz]`. An odd width aligns to no register boundary,
     /// so each axis vector is gathered from all three sources.
     #[inline(always)]
-    fn d3(&mut self, bound: Rd) -> Rd {
+    fn d3(&mut self, bound: Dist) -> Dist {
         let (m, q) = (self.m, self.q);
         let pat0 = F64s::from_array([q[0], q[1], q[2], q[0], q[1], q[2], q[0], q[1]]);
         let pat1 = F64s::from_array([q[2], q[0], q[1], q[2], q[0], q[1], q[2], q[0]]);
@@ -488,7 +514,7 @@ impl<S: Sink> Scan<'_, S> {
 
     /// Two 4-d points per register: `[p0: 0..4 | p1: 0..4]`.
     #[inline(always)]
-    fn d4(&mut self, bound: Rd) -> Rd {
+    fn d4(&mut self, bound: Dist) -> Dist {
         let (m, q) = (self.m, self.q);
         let pattern = F64s::from_array([q[0], q[1], q[2], q[3], q[0], q[1], q[2], q[3]]);
         self.packed::<LANES, 2, 4>(bound, |c| {
@@ -511,7 +537,7 @@ impl<S: Sink> Scan<'_, S> {
     /// point on its own would cost an `hsum` apiece and serialize on one
     /// dependency chain, which at this width the early exit cannot leave.
     #[inline(always)]
-    fn d8(&mut self, bound: Rd) -> Rd {
+    fn d8(&mut self, bound: Dist) -> Dist {
         let (m, q) = (self.m, self.q);
         let pattern = F64s::from_slice(q);
         self.packed::<{ LANES * LANES }, LANES, LANES>(bound, |c| {
@@ -536,17 +562,17 @@ impl<S: Sink> Scan<'_, S> {
     }
 }
 
-/// Zero when `q` is inside `b`. Comparable against [`point_rd`].
+/// Zero when `q` is inside `b`. Comparable against [`point_dist`].
 #[inline]
-pub(crate) fn box_rd(m: Metric, q: &[f64], b: BBox<'_>) -> Rd {
-    Rd::reduced(match m {
-        Metric::L1 | Metric::L2 => box_rd_sum(m, q, b.lo, b.hi),
-        Metric::LInf => box_rd_linf(q, b.lo, b.hi),
-        Metric::LP(p) => box_rd_lp(p, q, b.lo, b.hi),
+pub(crate) fn box_dist(m: Metric, q: &[f64], b: BBox<'_>) -> Dist {
+    Dist::from_repr(match m {
+        Metric::L1 | Metric::L2 => box_dist_sum(m, q, b.lo, b.hi),
+        Metric::LInf => box_dist_linf(q, b.lo, b.hi),
+        Metric::LP(p) => box_dist_lp(p, q, b.lo, b.hi),
     })
 }
 
-fn box_rd_sum(m: Metric, q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
+fn box_dist_sum(m: Metric, q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
     let (q_chunks, q_rest) = q.as_chunks::<LANES>();
     let (lo_chunks, lo_rest) = lo.as_chunks::<LANES>();
     let (hi_chunks, hi_rest) = hi.as_chunks::<LANES>();
@@ -560,14 +586,14 @@ fn box_rd_sum(m: Metric, q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
         );
         acc += axes_lanes(m, off);
     }
-    let mut rd = if q_chunks.is_empty() { 0.0 } else { hsum(acc) };
+    let mut dist = if q_chunks.is_empty() { 0.0 } else { hsum(acc) };
     for ((&qs, &ls), &hs) in q_rest.iter().zip(lo_rest).zip(hi_rest) {
-        rd += m.reduce(axis_offset(qs, ls, hs)).get();
+        dist += m.reduce(axis_offset(qs, ls, hs)).get();
     }
-    rd
+    dist
 }
 
-fn box_rd_linf(q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
+fn box_dist_linf(q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
     let mut worst = 0.0_f64;
     for ((&qs, &ls), &hs) in q.iter().zip(lo).zip(hi) {
         let off = axis_offset(qs, ls, hs);
@@ -578,13 +604,13 @@ fn box_rd_linf(q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
     worst
 }
 
-fn box_rd_lp(p: f64, q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
-    let mut rd = 0.0_f64;
+fn box_dist_lp(p: f64, q: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
+    let mut dist = 0.0_f64;
     for ((&qs, &ls), &hs) in q.iter().zip(lo).zip(hi) {
         let off = axis_offset(qs, ls, hs);
         if off > 0.0 {
-            rd += off.powf(p);
+            dist += off.powf(p);
         }
     }
-    rd
+    dist
 }

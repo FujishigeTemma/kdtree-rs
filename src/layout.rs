@@ -195,6 +195,7 @@ impl BBoxMut<'_> {
 }
 
 /// One box per node, `[lo[0..ndim] | hi[0..ndim]]` each, indexed by node id.
+#[derive(PartialEq)]
 pub(crate) struct Boxes {
     values: Vec<f64>,
     ndim: usize,

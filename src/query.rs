@@ -16,9 +16,9 @@ use std::marker::PhantomData;
 use rayon::prelude::*;
 
 use crate::error::KDTreeError;
-use crate::kernel::{self, Folded, Packed, Plan, Streamed, Strategy};
+use crate::kernel::{self, Strategy, with_plan};
 use crate::layout::{BBox, axis_offset};
-use crate::metric::{Metric, Rd};
+use crate::metric::{Dist, Metric};
 use crate::tree::{Node, ROOT, Tree};
 
 /// A query can be well under a microsecond, so without a floor rayon's per-task
@@ -50,14 +50,14 @@ impl Tree {
             return Err(KDTreeError::InvalidEps(eps));
         }
         let max_distance = max_distance.unwrap_or(f64::INFINITY);
-        if !max_distance.is_infinite() && (!max_distance.is_finite() || max_distance < 0.0) {
+        if max_distance.is_nan() || max_distance < 0.0 {
             return Err(KDTreeError::InvalidMaxDistance(max_distance));
         }
 
         let metric = Metric::new(p)?;
         let params = QueryParams {
             cutoff: metric.reduce(max_distance),
-            eps_factor: metric.eps_factor(eps),
+            eps_factor: metric.reduce(1.0 + eps).get(),
             metric,
         };
 
@@ -68,33 +68,32 @@ impl Tree {
         // Monomorphizing over the metric as well was measured slower: the
         // const-folded kernels inline into `descend` and bloat it, where the
         // enum dispatch stays perfectly predicted.
-        let args = (queries, k, params, parallel);
-        let (d, i) = (&mut distances, &mut indices);
-        match (k == 1, kernel::plan(metric, self.ndim())) {
-            (true, Plan::Packed) => self.run::<Best1, Packed>(args, d, i),
-            (true, Plan::FoldedAbs) => self.run::<Best1, Folded<false>>(args, d, i),
-            (true, Plan::FoldedSquared) => self.run::<Best1, Folded<true>>(args, d, i),
-            (true, Plan::Streamed) => self.run::<Best1, Streamed>(args, d, i),
-            (false, Plan::Packed) => self.run::<BestK, Packed>(args, d, i),
-            (false, Plan::FoldedAbs) => self.run::<BestK, Folded<false>>(args, d, i),
-            (false, Plan::FoldedSquared) => self.run::<BestK, Folded<true>>(args, d, i),
-            (false, Plan::Streamed) => self.run::<BestK, Streamed>(args, d, i),
-        }
+        with_plan!(metric, self.ndim(), |S| if k == 1 {
+            self.run::<Best1, S>(queries, k, params, parallel, &mut distances, &mut indices)
+        } else {
+            self.run::<BestK, S>(queries, k, params, parallel, &mut distances, &mut indices)
+        });
 
         Ok((distances, indices))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run<B: Best, K: Strategy>(
         &self,
-        (queries, k, params, parallel): (&[f64], usize, QueryParams, bool),
+        queries: &[f64],
+        k: usize,
+        params: QueryParams,
+        parallel: bool,
         distances: &mut [f64],
         indices: &mut [i64],
     ) {
         let ndim = self.ndim();
+        let n_points = self.n_points();
         let n_queries = queries.len() / ndim;
         let run = |scratch: &mut Scratch<B>, i: usize, out_d: &mut [f64], out_i: &mut [i64]| {
             let descent = Descent::<K> {
                 tree: self,
+                n_points,
                 params,
                 q: &queries[i * ndim..(i + 1) * ndim],
                 strategy: PhantomData,
@@ -125,8 +124,7 @@ impl Tree {
 
 #[derive(Clone, Copy)]
 struct QueryParams {
-    /// `max_distance`, reduced.
-    cutoff: Rd,
+    cutoff: Dist,
     eps_factor: f64,
     metric: Metric,
 }
@@ -156,64 +154,66 @@ impl<B: Best> Scratch<B> {
 /// query inside the root box, the common case, so [`CellBound::start`] normally
 /// writes nothing and [`CellBound::finish`] has nothing to undo.
 struct CellBound {
-    axes: Vec<Rd>,
+    axes: Vec<Dist>,
     seeded: bool,
 }
 
 impl CellBound {
     fn new(ndim: usize) -> Self {
         Self {
-            axes: vec![Rd::ZERO; ndim],
+            axes: vec![Dist::ZERO; ndim],
             seeded: false,
         }
     }
 
     #[inline(always)]
-    fn start(&mut self, m: Metric, q: &[f64], root: BBox<'_>) -> Rd {
-        if kernel::box_rd(m, q, root) == Rd::ZERO {
-            return Rd::ZERO;
+    fn start(&mut self, m: Metric, q: &[f64], root: BBox<'_>) -> Dist {
+        if kernel::box_dist(m, q, root) == Dist::ZERO {
+            return Dist::ZERO;
         }
         self.seed(m, q, root)
     }
 
-    fn seed(&mut self, m: Metric, q: &[f64], root: BBox<'_>) -> Rd {
-        let mut rd = Rd::ZERO;
+    fn seed(&mut self, m: Metric, q: &[f64], root: BBox<'_>) -> Dist {
+        let mut dist = Dist::ZERO;
         let bounds = q.iter().zip(root.lo).zip(root.hi);
         for (slot, ((&q, &lo), &hi)) in self.axes.iter_mut().zip(bounds) {
             let axis = m.reduce(axis_offset(q, lo, hi));
             *slot = axis;
-            rd = m.fold(rd, axis);
+            dist = m.fold(dist, axis);
         }
         self.seeded = true;
-        rd
+        dist
     }
 
     fn finish(&mut self) {
         if self.seeded {
-            self.axes.fill(Rd::ZERO);
+            self.axes.fill(Dist::ZERO);
             self.seeded = false;
         }
     }
 
     #[inline(always)]
-    fn axis(&self, dim: usize) -> Rd {
+    fn axis(&self, dim: usize) -> Dist {
         self.axes[dim]
     }
 
     #[inline(always)]
     #[must_use = "the previous axis contribution has to be restored by `leave`"]
-    fn enter(&mut self, dim: usize, axis: Rd) -> Rd {
+    fn enter(&mut self, dim: usize, axis: Dist) -> Dist {
         std::mem::replace(&mut self.axes[dim], axis)
     }
 
     #[inline(always)]
-    fn leave(&mut self, dim: usize, saved: Rd) {
+    fn leave(&mut self, dim: usize, saved: Dist) {
         self.axes[dim] = saved;
     }
 }
 
 struct Descent<'a, K: Strategy> {
     tree: &'a Tree,
+    /// Hoisted from [`Tree::n_points`] so the division is not redone per query.
+    n_points: usize,
     params: QueryParams,
     q: &'a [f64],
     strategy: PhantomData<K>,
@@ -221,34 +221,32 @@ struct Descent<'a, K: Strategy> {
 
 impl<K: Strategy> Descent<'_, K> {
     fn run<B: Best>(&self, s: &mut Scratch<B>, out_d: &mut [f64], out_i: &mut [i64]) {
-        let QueryParams {
-            cutoff,
-            eps_factor,
-            metric,
-        } = self.params;
+        let metric = self.params.metric;
         s.best.reset();
         let seed = s.cell.start(metric, self.q, self.tree.root_box());
-        if seed.scaled(eps_factor) <= cutoff {
+        if self.admits(seed, s) {
             self.descend(ROOT, seed, s);
         }
         s.cell.finish();
-        s.best
-            .write_results(out_d, out_i, self.tree.n_points(), metric);
+        s.best.write_results(out_d, out_i, self.n_points, metric);
     }
 
     #[inline(always)]
-    fn admits<B: Best>(&self, rd: Rd, s: &Scratch<B>) -> bool {
-        rd.scaled(self.params.eps_factor) <= s.best.bound(self.params.cutoff)
+    fn admits<B: Best>(&self, dist: Dist, s: &Scratch<B>) -> bool {
+        self.admits_at(dist, s.best.bound(self.params.cutoff))
     }
 
-    /// `cell_rd` is the lower bound of `node_id`'s cell; its per-axis parts are
+    /// [`Descent::admits`] with the bound already in hand, for sites that hoist
+    /// one `bound` across several tests.
+    #[inline(always)]
+    fn admits_at(&self, dist: Dist, bound: Dist) -> bool {
+        dist.get() * self.params.eps_factor <= bound.get()
+    }
+
+    /// `cell_dist` is the lower bound of `node_id`'s cell; its per-axis parts are
     /// in `s.cell`.
-    fn descend<B: Best>(&self, node_id: u32, cell_rd: Rd, s: &mut Scratch<B>) {
-        let QueryParams {
-            cutoff,
-            eps_factor,
-            metric,
-        } = self.params;
+    fn descend<B: Best>(&self, node_id: u32, cell_dist: Dist, s: &mut Scratch<B>) {
+        let QueryParams { cutoff, metric, .. } = self.params;
 
         match *self.tree.node(node_id) {
             Node::Leaf { start, end } => {
@@ -270,20 +268,20 @@ impl<K: Strategy> Descent<'_, K> {
                 };
 
                 let far_axis = metric.reduce(diff.abs());
-                let far_rd = metric.replace_axis(cell_rd, s.cell.axis(dim), far_axis);
+                let far_dist = metric.replace_axis(cell_dist, s.cell.axis(dim), far_axis);
 
                 if order_by_box {
-                    self.descend_by_box(near, far, dim, cell_rd, far_axis, far_rd, s);
+                    self.descend_by_box(near, far, dim, cell_dist, far_axis, far_dist, s);
                     return;
                 }
 
-                self.descend(near, cell_rd, s);
+                self.descend(near, cell_dist, s);
 
                 let bound = s.best.bound(cutoff);
-                if far_rd.scaled(eps_factor) <= bound {
+                if self.admits_at(far_dist, bound) {
                     let far_box = self.tree.box_of(far);
-                    if kernel::box_rd(metric, self.q, far_box).scaled(eps_factor) <= bound {
-                        self.enter_far(far, dim, far_axis, far_rd, s);
+                    if self.admits_at(kernel::box_dist(metric, self.q, far_box), bound) {
+                        self.enter_far(far, dim, far_axis, far_dist, s);
                     }
                 }
             }
@@ -302,36 +300,43 @@ impl<K: Strategy> Descent<'_, K> {
         near: u32,
         far: u32,
         dim: usize,
-        cell_rd: Rd,
-        far_axis: Rd,
-        far_rd: Rd,
+        cell_dist: Dist,
+        far_axis: Dist,
+        far_dist: Dist,
         s: &mut Scratch<B>,
     ) {
         let metric = self.params.metric;
-        let near_box = kernel::box_rd(metric, self.q, self.tree.box_of(near));
-        let far_box = kernel::box_rd(metric, self.q, self.tree.box_of(far));
+        let near_box = kernel::box_dist(metric, self.q, self.tree.box_of(near));
+        let far_box = kernel::box_dist(metric, self.q, self.tree.box_of(far));
 
         if near_box <= far_box {
             if self.admits(near_box, s) {
-                self.descend(near, cell_rd, s);
+                self.descend(near, cell_dist, s);
             }
             if self.admits(far_box, s) {
-                self.enter_far(far, dim, far_axis, far_rd, s);
+                self.enter_far(far, dim, far_axis, far_dist, s);
             }
         } else {
             if self.admits(far_box, s) {
-                self.enter_far(far, dim, far_axis, far_rd, s);
+                self.enter_far(far, dim, far_axis, far_dist, s);
             }
             if self.admits(near_box, s) {
-                self.descend(near, cell_rd, s);
+                self.descend(near, cell_dist, s);
             }
         }
     }
 
     #[inline(always)]
-    fn enter_far<B: Best>(&self, far: u32, dim: usize, far_axis: Rd, far_rd: Rd, s: &mut Scratch<B>) {
+    fn enter_far<B: Best>(
+        &self,
+        far: u32,
+        dim: usize,
+        far_axis: Dist,
+        far_dist: Dist,
+        s: &mut Scratch<B>,
+    ) {
         let saved = s.cell.enter(dim, far_axis);
-        self.descend(far, far_rd, s);
+        self.descend(far, far_dist, s);
         s.cell.leave(dim, saved);
     }
 
@@ -353,18 +358,19 @@ struct LeafSink<'a, B> {
     best: &'a mut B,
     originals: &'a [u32],
     start: usize,
-    cutoff: Rd,
+    cutoff: Dist,
 }
 
 impl<B: Best> kernel::Sink for LeafSink<'_, B> {
     #[inline(always)]
-    fn bound(&self) -> Rd {
+    fn bound(&self) -> Dist {
         self.best.bound(self.cutoff)
     }
 
     #[inline(always)]
-    fn offer(&mut self, offset: usize, rd: Rd) {
-        self.best.consider(rd, self.originals[self.start + offset]);
+    fn offer(&mut self, offset: usize, dist: Dist) {
+        self.best
+            .consider(dist, self.originals[self.start + offset]);
     }
 }
 
@@ -374,47 +380,47 @@ trait Best {
     fn new(k: usize) -> Self;
     fn reset(&mut self);
     /// The k-th best reduced distance so far, capped at `cutoff`.
-    fn bound(&self, cutoff: Rd) -> Rd;
+    fn bound(&self, cutoff: Dist) -> Dist;
     /// Ties must resolve toward the smaller original index: SciPy is the oracle
     /// in `tests/test_kdtree.py`, and indices are compared exactly.
-    fn consider(&mut self, rd: Rd, idx: u32);
+    fn consider(&mut self, dist: Dist, idx: u32);
     fn write_results(&self, out_d: &mut [f64], out_i: &mut [i64], n_points: usize, m: Metric);
 }
 
 struct Best1 {
-    rd: Rd,
+    dist: Dist,
     i: u32,
 }
 
 impl Best for Best1 {
     fn new(_k: usize) -> Self {
         Self {
-            rd: Rd::INFINITY,
+            dist: Dist::INFINITY,
             i: u32::MAX,
         }
     }
 
     fn reset(&mut self) {
-        self.rd = Rd::INFINITY;
+        self.dist = Dist::INFINITY;
         self.i = u32::MAX;
     }
 
     #[inline]
-    fn bound(&self, cutoff: Rd) -> Rd {
-        self.rd.min(cutoff)
+    fn bound(&self, cutoff: Dist) -> Dist {
+        self.dist.min(cutoff)
     }
 
     #[inline]
-    fn consider(&mut self, rd: Rd, idx: u32) {
-        if rd < self.rd || (rd == self.rd && idx < self.i) {
-            self.rd = rd;
+    fn consider(&mut self, dist: Dist, idx: u32) {
+        if dist < self.dist || (dist == self.dist && idx < self.i) {
+            self.dist = dist;
             self.i = idx;
         }
     }
 
     fn write_results(&self, out_d: &mut [f64], out_i: &mut [i64], n_points: usize, m: Metric) {
         if self.i != u32::MAX {
-            out_d[0] = m.restore(self.rd);
+            out_d[0] = m.restore(self.dist);
             out_i[0] = self.i as i64;
         } else {
             out_d[0] = f64::INFINITY;
@@ -425,7 +431,7 @@ impl Best for Best1 {
 
 struct BestK {
     k: usize,
-    rds: Vec<Rd>,
+    dists: Vec<Dist>,
     ids: Vec<u32>,
 }
 
@@ -433,51 +439,51 @@ impl Best for BestK {
     fn new(k: usize) -> Self {
         Self {
             k,
-            rds: Vec::with_capacity(k),
+            dists: Vec::with_capacity(k),
             ids: Vec::with_capacity(k),
         }
     }
 
     fn reset(&mut self) {
-        self.rds.clear();
+        self.dists.clear();
         self.ids.clear();
     }
 
     #[inline]
-    fn bound(&self, cutoff: Rd) -> Rd {
-        if self.rds.len() < self.k {
+    fn bound(&self, cutoff: Dist) -> Dist {
+        if self.dists.len() < self.k {
             cutoff
         } else {
-            self.rds[self.k - 1].min(cutoff)
+            self.dists[self.k - 1].min(cutoff)
         }
     }
 
     #[inline]
-    fn consider(&mut self, rd: Rd, idx: u32) {
-        if self.rds.len() == self.k {
-            let worst_rd = self.rds[self.k - 1];
-            if rd > worst_rd || (rd == worst_rd && self.ids[self.k - 1] <= idx) {
+    fn consider(&mut self, dist: Dist, idx: u32) {
+        if self.dists.len() == self.k {
+            let worst_dist = self.dists[self.k - 1];
+            if dist > worst_dist || (dist == worst_dist && self.ids[self.k - 1] <= idx) {
                 return;
             }
-            self.rds.pop();
+            self.dists.pop();
             self.ids.pop();
         }
-        let mut pos = self.rds.len();
+        let mut pos = self.dists.len();
         while pos > 0 {
-            let prev_rd = self.rds[pos - 1];
-            if prev_rd < rd || (prev_rd == rd && self.ids[pos - 1] < idx) {
+            let prev_dist = self.dists[pos - 1];
+            if prev_dist < dist || (prev_dist == dist && self.ids[pos - 1] < idx) {
                 break;
             }
             pos -= 1;
         }
-        self.rds.insert(pos, rd);
+        self.dists.insert(pos, dist);
         self.ids.insert(pos, idx);
     }
 
     fn write_results(&self, out_d: &mut [f64], out_i: &mut [i64], n_points: usize, m: Metric) {
         for j in 0..out_d.len() {
-            if j < self.rds.len() {
-                out_d[j] = m.restore(self.rds[j]);
+            if j < self.dists.len() {
+                out_d[j] = m.restore(self.dists[j]);
                 out_i[j] = self.ids[j] as i64;
             } else {
                 out_d[j] = f64::INFINITY;
